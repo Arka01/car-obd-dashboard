@@ -1,0 +1,9 @@
+# drive recordings and adapter logs (personal data, regenerated on every run)
+recordings/
+obd.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
