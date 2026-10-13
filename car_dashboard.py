@@ -26,9 +26,13 @@ Run
     python car_dashboard.py --demo          # fake data, no car needed
     python car_dashboard.py --replay recordings/drive_20261009_1915.csv   # play a recorded drive back
     python car_dashboard.py --debug         # log adapter traffic (to obd.log once the dashboard starts)
+    python car_dashboard.py --probe         # read-only scan: which modules answer (AMT?) and what they report
+    python car_dashboard.py --refuel 30.5 --full   # after a fill-up: litres from the receipt, filled to cut-off
+    python car_dashboard.py --calibrate-gears      # measure each gear from the recorded drives
 
-Every connected run records its readings to recordings/drive_<date>_<time>.csv and saves what the
-car supports to recordings/car_profile.json, so drives can be replayed at home without the car.
+Every real run (anything except --demo and --replay) is recorded in recordings/, named by date and
+time: drive_<date>_<time>.csv (dashboard) or all_<date>_<time>.csv (--all), plus
+drive_<date>_<time>_profile.json with what the car supports, so drives can be analysed and replayed.
 Ctrl+C quits.
 """
 
@@ -41,6 +45,8 @@ import math
 import os
 import random
 import re
+import shutil
+import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -48,6 +54,9 @@ from datetime import datetime
 
 from rich.live import Live
 
+from battery_monitor import BatteryMonitor
+from fuel_tracker import FuelTracker
+from warmup_advisor import WarmUpAdvisor
 from dashboard_design import (
     CRITICAL,
     NOT_SUPPORTED,
@@ -55,6 +64,7 @@ from dashboard_design import (
     as_number,
     console,
     gear_name,
+    print_probe_report,
     minutes,
     render_all,
     render_dashboard,
@@ -63,21 +73,28 @@ from dashboard_design import (
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECORD_DIR = os.path.join(HERE, "recordings")
 LOG_PATH = os.path.join(HERE, "obd.log")
+FUEL_STATE_PATH = os.path.join(HERE, "fuel_state.json")  # fuel left + what's been learned, kept between drives
+BATTERY_STATE_PATH = os.path.join(HERE, "battery_state.json")  # history of starting (cranking) voltages
 ATTEMPTS = 2  # Bluetooth links often fail on the first try and work on the next
 
 # ---------------------------------------------------------------- CAR SETTINGS (assumed; tweak for your car)
 
 SHIFT_RPM, REDLINE_RPM = 3500, 4000  # RPM sweep turns amber / red
+TANK_LITRES = 35.0  # Tiago petrol tank (Autocar India spec pages)
+ENGINE_LITRES = 1.199  # 1.2 Revotron displacement; used by the backup fuel estimate
+VOLUMETRIC_EFFICIENCY = 0.85  # how well the engine fills its cylinders; rough typical value
 # Gear estimate. Tata doesn't publish the Tiago's gear ratios; these come from an engineering
 # exercise that assumed them (LinkedIn, Suriaa). Tyre size 175/60 R15 is from CarWale/CarDekho.
 GEAR_RATIOS = [3.73, 2.05, 1.32, 0.94, 0.74]
 FINAL_DRIVE = 4.06
 TYRE_WIDTH_MM, TYRE_PROFILE_PCT, RIM_INCH = 175, 60, 15
 TYRE_CIRCUMFERENCE_M = math.pi * (RIM_INCH * 25.4 + 2 * TYRE_WIDTH_MM * TYRE_PROFILE_PCT / 100) / 1000
-# Engine rpm per 1 km/h in each gear: wheel turns per minute at 1 km/h x gearbox ratio x final drive.
-GEAR_RPM_PER_KMH = [r * FINAL_DRIVE * (1000 / 60) / TYRE_CIRCUMFERENCE_M for r in GEAR_RATIOS]
-# Calibrate: drive steadily in each gear, note "RPM per km/h" (in a recording or with --all), and
-# replace the list above with your measured numbers, e.g. GEAR_RPM_PER_KMH = [136, 75, 48, 34, 27].
+# Engine rpm per 1 km/h in each gear in theory: wheel turns per minute at 1 km/h x gear ratio x final drive.
+THEORETICAL_RPM_PER_KMH = [r * FINAL_DRIVE * (1000 / 60) / TYRE_CIRCUMFERENCE_M for r in GEAR_RATIOS]
+# Measured from two drives on 2026-10-13 with --calibrate-gears: 1st 149.6, 2nd 79.0, 3rd 51.4.
+# Those drives never reached 4th/5th, so those are the theoretical values scaled by the 6.8 % that
+# the measured gears came out above theory. Re-run --calibrate-gears after a highway drive and update.
+GEAR_RPM_PER_KMH = [149.6, 79.0, 51.4, 36.6, 28.8]
 
 
 # ---------------------------------------------------------------- the stats
@@ -96,73 +113,95 @@ class Stat:
     every: int = 1  # read every Nth update; slow-changing stats less often keeps fast ones snappy
     center: float = None  # bars grow up/down from this value, e.g. 0 for fuel trims
     fmt: object = None  # custom value -> text, instead of the number + unit
-    group: str = "car"  # where it's drawn: "cockpit", "temps", "engine", "trip" or "car"
+    # Where it's drawn: "power" (shift lights, gear, speed, torque...), "meters" (bar meters in POWER), "heat",
+    # "mixture" (in FUEL), "status" (bottom bar) or "inputs" (not drawn; used by calculations).
+    group: str = "status"
     decimals: int = 1
-    short: str = ""  # short name for tight spots (engine meters, footer line)
+    short: str = ""  # short name for tight spots (bar meters, status bar)
     empty: str = "waiting..."  # shown while there is no value yet
 
 
 STATS = [
-    # --- cockpit: RPM sweep, gear and speed in the middle of the dash
-    Stat("Speed", "SPEED", "km/h", 0, 200, group="cockpit"),
+    # --- power: shift lights, RPM / gear / speed, torque/power and sprint times
+    Stat("Speed", "SPEED", "km/h", 0, 200, group="power"),
     Stat("RPM", "RPM", "rpm", 0, REDLINE_RPM + 1000, [  # scale ends 1000 above redline
         (lambda v: v > REDLINE_RPM, CRITICAL, "REDLINE"),
         (lambda v: v > SHIFT_RPM, WARNING, "SHIFT"),
-    ], group="cockpit"),
-    Stat("Gear (estimated)", None, "", 0, 5, fmt=gear_name, group="cockpit"),
+    ], group="power"),
+    Stat("Gear (estimated)", None, "", 0, 5, fmt=gear_name, group="power"),
 
-    # --- temperatures: left column, coolant + oil in big digits
+    # --- heat: coolant + oil in big digits, the other temperatures smaller
     Stat("Coolant", "COOLANT_TEMP", "degC", 0, 130, [
         (lambda v: v > 115, CRITICAL, "OVERHEATING"),
         (lambda v: v > 105, WARNING, "HOT"),
         (lambda v: v < 60, WARNING, "WARMING UP"),
-    ], every=10, group="temps", decimals=0),
+    ], every=10, group="heat", decimals=0),
     Stat("Oil", "OIL_TEMP", "degC", 0, 150, [
         (lambda v: v > 135, CRITICAL, "OVERHEATING"),
         (lambda v: v > 120, WARNING, "HOT"),
         (lambda v: v < 60, WARNING, "COLD"),  # go easy until oil is warm
-    ], every=10, group="temps", decimals=0),
-    Stat("Intake air", "INTAKE_TEMP", "degC", -20, 80, [
+    ], every=10, group="heat", decimals=0),
+    Stat("Intake air", "INTAKE_TEMP", "degC", -20, 80, short="INTAKE", alerts=[
         (lambda v: v > 60, WARNING, "HOT AIR"),  # heat soak: less power
-    ], every=10, group="temps", decimals=0),
-    Stat("Outside", "AMBIANT_AIR_TEMP", "degC", -20, 50, every=10, group="temps", decimals=0),
+    ], every=10, group="heat", decimals=0),
+    Stat("Outside", "AMBIANT_AIR_TEMP", "degC", -20, 50, every=10, group="heat", decimals=0),
+    Stat("Heat soak", None, "degC", -10, 40, [  # intake air minus outside air: hot air in = less power
+        (lambda v: v > 25, WARNING, "HOT INTAKE"),
+    ], group="heat", fmt=lambda v: f"{v:+.0f} °C"),
     Stat("Catalyst", "CATALYST_TEMP_B1S1", "degC", 0, 1000, [
         (lambda v: v > 900, CRITICAL, "TOO HOT"),
         (lambda v: v < 300, WARNING, "COLD"),  # cleans exhaust only once hot
-    ], every=10, group="temps", decimals=0),
+    ], every=10, group="heat", decimals=0),
 
-    # --- engine: vertical bar meters below the dash
-    Stat("Throttle", "THROTTLE_POS", "percent", 0, 100, group="engine", short="THROTTLE", decimals=0),
-    Stat("Accelerator pedal", "ACCELERATOR_POS_D", "percent", 0, 100, group="engine", short="PEDAL", decimals=0),
-    Stat("Engine load", "ENGINE_LOAD", "percent", 0, 100, group="engine", short="LOAD", decimals=0),
-    Stat("Manifold pressure", "INTAKE_PRESSURE", "kilopascal", 0, 120, every=2, group="engine", short="MANIFOLD",
+    # --- bar meters in POWER, and the air-fuel mixture (shown in FUEL)
+    # Relative versions (PIDs 45 / 5A) are rescaled to a true 0-100 %; the plain ones never drop below ~10-15 %.
+    Stat("Throttle", "RELATIVE_THROTTLE_POS", "percent", 0, 100, group="meters", short="THROTTLE", decimals=0),
+    Stat("Accelerator pedal", "RELATIVE_ACCEL_POS", "percent", 0, 100, group="meters", short="PEDAL", decimals=0),
+    Stat("Engine load", "ENGINE_LOAD", "percent", 0, 100, group="meters", short="LOAD", decimals=0),
+    Stat("Manifold pressure", "INTAKE_PRESSURE", "kilopascal", 0, 120, every=2, group="meters", short="MANIFOLD",
          decimals=0),
-    Stat("Air flow (MAF)", "MAF", "gps", 0, 60, every=2, group="engine", short="AIR FLOW"),
-    Stat("Timing advance", "TIMING_ADVANCE", "degree", -10, 50, every=2, center=0, group="engine", short="TIMING",
+    Stat("Air flow (MAF)", "MAF", "gps", 0, 60, every=2, group="meters", short="AIRFLOW"),
+    Stat("Timing advance", "TIMING_ADVANCE", "degree", -10, 50, every=2, center=0, group="meters", short="TIMING",
          decimals=0),
-    Stat("Lambda (commanded)", "COMMANDED_EQUIV_RATIO", "ratio", 0.7, 1.3, every=2, center=1.0, group="engine",
+    Stat("Lambda (commanded)", "COMMANDED_EQUIV_RATIO", "ratio", 0.7, 1.3, every=2, center=1.0, group="mixture",
          short="LAMBDA", decimals=2),  # <1 = rich (more fuel, e.g. full throttle), >1 = lean
-    Stat("Short fuel trim", "SHORT_FUEL_TRIM_1", "percent", -25, 25, every=2, center=0, group="engine",
+    Stat("Short fuel trim", "SHORT_FUEL_TRIM_1", "percent", -25, 25, every=2, center=0, group="mixture",
          short="TRIM NOW"),
     Stat("Long fuel trim", "LONG_FUEL_TRIM_1", "percent", -25, 25, [
         (lambda v: abs(v) > 20, CRITICAL, "CHECK"),  # engine constantly correcting the mix
         (lambda v: abs(v) > 10, WARNING, "OFF"),
-    ], every=10, center=0, group="engine", short="TRIM LEARN"),
-    Stat("EGR (commanded)", "COMMANDED_EGR", "percent", 0, 100, every=2, group="engine", short="EGR", decimals=0),
+    ], every=10, center=0, group="mixture", short="TRIM LEARN"),
+    Stat("EGR (commanded)", "COMMANDED_EGR", "percent", 0, 100, every=2, group="meters", short="EGR", decimals=0),
 
-    # --- trip (calculated, right column) and car (slow-changing, footer line)
-    Stat("Acceleration", None, "g", -0.6, 0.6, center=0, decimals=2, group="trip"),
-    Stat("Trip distance", None, "km", 0, 100, decimals=2, group="trip"),
-    Stat("Trip avg speed", None, "km/h", 0, 120, group="trip"),
-    Stat("0-60 km/h best", None, "s", 0, 20, empty="stop, then floor it", group="trip"),
-    Stat("0-100 km/h best", None, "s", 0, 30, empty="stop, then floor it", group="trip"),
-    Stat("RPM per km/h", None, "", 0, 150, empty="drive > 5 km/h", group="trip"),  # for gear calibration
+    # --- fuel: inputs to the fuel tracker (drawn as the FUEL LEFT block, not as tiles)
+    Stat("Fuel level", "FUEL_LEVEL", "percent", 0, 100, every=3, group="fuel"),
+    Stat("Fuel rate", "FUEL_RATE", "lph", 0, 15, group="fuel"),  # every update: counting needs it
+
+    # --- the two pedal sensors, read together every 3rd update for the redundancy check (not drawn)
+    Stat("Pedal sensor D", "ACCELERATOR_POS_D", "percent", 0, 100, every=3, group="inputs"),
+    Stat("Pedal sensor E", "ACCELERATOR_POS_E", "percent", 0, 100, every=3, group="inputs"),
+
+    # --- engine output: raw inputs (not drawn) and the torque/power meters calculated from them
+    Stat("Engine torque %", "ACTUAL_TORQUE_PCT", "percent", -125, 130, group="inputs"),
+    Stat("Reference torque", "REFERENCE_TORQUE", "Nm", 0, 500, every=50, group="inputs"),  # a fixed number
+    Stat("Torque", None, "Nm", -20, 120, center=0, group="power", short="TORQUE", decimals=0),  # 113 Nm peak
+    Stat("Power", None, "bhp", -10, 90, center=0, group="power", short="POWER", decimals=0),  # 84 bhp peak
+
+    # --- status bar: trip and slow-changing car info
+    Stat("Acceleration", None, "g", -0.6, 0.6, center=0, decimals=2, group="power", short="ACCEL"),
+    Stat("Trip distance", None, "km", 0, 100, decimals=1, group="status", short="TRIP"),
+    Stat("Trip avg speed", None, "km/h", 0, 120, group="status", short="AVG", decimals=0),
+    Stat("0-60 km/h best", None, "s", 0, 20, empty="--", group="power", short="0-60"),
+    Stat("0-100 km/h best", None, "s", 0, 30, empty="--", group="power", short="0-100"),
+    Stat("RPM per km/h", None, "", 0, 150, group="inputs"),  # used by --calibrate-gears
     Stat("Engine run time", "RUN_TIME", "second", 0, 3600, every=10, fmt=minutes, short="RUN"),
-    Stat("Battery", "CONTROL_MODULE_VOLTAGE", "volt", 10, 16, [
-        (lambda v: v < 11.8, CRITICAL, "VERY LOW"),
-        (lambda v: v < 12.2, WARNING, "LOW"),
-        (lambda v: v > 15.0, WARNING, "OVERCHARGING"),
-    ], every=10, short="BATTERY"),
+    Stat("Pedal sensor mismatch", None, "pts", 0, 30, [
+        (lambda v: v > 20, CRITICAL, "PEDAL SENSORS DISAGREE"),
+        (lambda v: v > 10, WARNING, "PEDAL SENSORS DISAGREE"),
+    ], short="PEDAL CHECK", empty="move the pedal fully once"),
+    # Battery: two independent readings for the battery monitor (drawn as the BATTERY item, not as tiles)
+    Stat("Battery", "CONTROL_MODULE_VOLTAGE", "volt", 10, 16, every=10, group="inputs"),  # engine computer
+    Stat("Battery (port)", "ELM_VOLTAGE", "volt", 10, 16, every=2, group="inputs"),  # adapter at the OBD socket
     Stat("Barometric pressure", "BAROMETRIC_PRESSURE", "kilopascal", 70, 105, every=10, short="BARO", decimals=0),
     Stat("Since codes cleared", "DISTANCE_SINCE_DTC_CLEAR", "kilometer", 0, 10000, every=10, decimals=0,
          short="CODES CLEARED"),
@@ -283,12 +322,32 @@ def log_to_file():
 # ---------------------------------------------------------------- reading values
 
 
+# Standard PIDs that python-OBD 0.7.3 doesn't know: name -> (request, reply bytes, formula on data bytes).
+# Formulas from Wikipedia's OBD-II PID table. The probe showed the Tiago's engine supports both.
+CUSTOM_PIDS = {
+    "ACTUAL_TORQUE_PCT": (b"0162", 3, lambda d: d[0] - 125),  # actual engine torque, % of reference
+    "REFERENCE_TORQUE": (b"0163", 4, lambda d: d[0] * 256 + d[1]),  # Nm that 100 % stands for
+}
+CUSTOM_FAILURES = {}  # custom PID -> unanswered requests in a row; after 3 it counts as unsupported
+
+
+def custom_command(name):
+    import obd
+    from obd.protocols import ECU
+
+    request, size, formula = CUSTOM_PIDS[name]
+    return obd.OBDCommand(name, name, request, size, lambda messages: formula(messages[0].data[2:]), ECU.ENGINE, True)
+
+
 def read_stats(connection, stats):
     """{label: number}, or None (no data) / NOT_SUPPORTED (car doesn't report it)."""
     import obd
 
     values = {}
     for stat in stats:
+        if stat.command in CUSTOM_PIDS:
+            values[stat.label] = read_custom(connection, stat.command)
+            continue
         cmd = obd.commands[stat.command]
         if not connection.supports(cmd):
             values[stat.label] = NOT_SUPPORTED
@@ -298,8 +357,23 @@ def read_stats(connection, stats):
     return values
 
 
+def read_custom(connection, name):
+    """python-OBD doesn't track support for these, so just ask, and give up after 3 silent tries."""
+    if CUSTOM_FAILURES.get(name, 0) >= 3:
+        return NOT_SUPPORTED
+    response = connection.query(custom_command(name), force=True)
+    if response.is_null():
+        CUSTOM_FAILURES[name] = CUSTOM_FAILURES.get(name, 0) + 1
+        return None
+    CUSTOM_FAILURES[name] = 0
+    return float(response.value)
+
+
 def read_everything(connection):
-    """Every live-data (mode 01) command this car says it supports, as {description: text}."""
+    """Every live-data (mode 01) command this car says it supports, as {description: (text, number)}.
+
+    text is for showing ("44.0 °C"); number is the plain value for recording (None if not a number).
+    """
     commands = [
         cmd for cmd in connection.supported_commands
         if cmd.mode == 1 and not cmd.name.startswith("PIDS_")  # PIDS_* only list what's supported
@@ -309,8 +383,14 @@ def read_everything(connection):
         response = connection.query(cmd)
         text = "no data" if response.is_null() else describe(response.value)
         if text is not None:
-            values[cmd.desc] = text
+            number = response.value.magnitude if hasattr(response.value, "magnitude") else None
+            values[cmd.desc] = (text, number)
     return values
+
+
+def texts(values):
+    """{description: text} from read_everything's {description: (text, number)}."""
+    return {label: text for label, (text, _) in values.items()}
 
 
 def describe(value):
@@ -329,14 +409,19 @@ def describe(value):
 def fake_values(t):
     """Believable fake values so the dashboard can be tried without a car.
 
-    Repeats a 40 s cycle: accelerate from a stop to 110 km/h through the gears, then brake to a stop.
+    Starts like a cold start (25 s standing with a fast idle), then repeats a 40 s cycle: accelerate
+    from a stop to 110 km/h through the gears, then brake to a stop.
     """
-    x = t % 40
-    accelerating = x < 20
-    speed = 110 * (x / 20) ** 0.8 if accelerating else 110 * (1 - (x - 20) / 20)
+    x = (t - 25) % 40 if t >= 25 else None  # first 25 s: standing, like after a cold start
+    accelerating = x is not None and x < 20
+    if x is None:
+        speed = 0.0
+    else:
+        speed = 110 * (x / 20) ** 0.8 if accelerating else 110 * (1 - (x - 20) / 20)
     gear = sum(speed > s for s in (0.5, 20, 35, 55, 75))  # 0 = stopped
-    rpm = 800 if gear == 0 else max(900, speed * GEAR_RPM_PER_KMH[gear - 1]) + random.uniform(-40, 40)
-    throttle = 55 + random.uniform(-5, 5) if accelerating else 3
+    fast_idle = max(0.0, 380 - t * 12)  # cold start: idle starts high and settles
+    rpm = 860 + fast_idle if gear == 0 else max(900, speed * GEAR_RPM_PER_KMH[gear - 1]) + random.uniform(-40, 40)
+    throttle = 55 + random.uniform(-5, 5) if accelerating else (0 if x is None else 3)
     return {
         "Speed": speed,
         "RPM": rpm,
@@ -347,6 +432,8 @@ def fake_values(t):
         "Catalyst": min(650, 100 + t * 12),
         "Throttle": throttle,
         "Accelerator pedal": throttle * 0.9,
+        "Pedal sensor D": 14.9 + throttle * 0.9 * 0.74,  # raw sensors: offset and different ranges, like the real car
+        "Pedal sensor E": 7.5 + throttle * 0.9 * 0.37,
         "Engine load": throttle * 1.2 + 15,
         "Manifold pressure": 30 + throttle * 1.1,
         "Air flow (MAF)": rpm / 400 + throttle * 0.25,
@@ -355,8 +442,13 @@ def fake_values(t):
         "Short fuel trim": random.uniform(-6, 6),
         "Long fuel trim": -2.3,
         "EGR (commanded)": NOT_SUPPORTED,
+        "Fuel level": 62 - t * 0.01 + random.uniform(-3, 3),  # float sensor sloshes around
+        "Fuel rate": 0.8 + throttle * 0.11,  # litres/hour: ~0.8 at idle, ~7 when accelerating
+        "Engine torque %": throttle * 1.6 - 5,  # % of reference torque; negative = engine braking
+        "Reference torque": 113,
         "Engine run time": t,
-        "Battery": 14.1 + random.uniform(-0.1, 0.1),
+        "Battery": 14.0 + random.uniform(-0.1, 0.1),
+        "Battery (port)": 14.1 + random.uniform(-0.1, 0.1),
         "Barometric pressure": 96.0,
         "Since codes cleared": 2350,
         "Driven w/ check-engine": 0,
@@ -377,6 +469,129 @@ def estimate_gear(speed, rpm):
     ratio = rpm / speed
     best = min(range(len(GEAR_RPM_PER_KMH)), key=lambda i: abs(math.log(ratio / GEAR_RPM_PER_KMH[i])))
     return best + 1 if abs(math.log(ratio / GEAR_RPM_PER_KMH[best])) < 0.15 else None
+
+
+def engine_output(values):
+    """Torque (Nm) and power (PS) from the engine computer's own torque estimate.
+
+    "Actual torque %" is the ECU's modelled output as a percentage of its reference torque, not a
+    dyno measurement, but it follows the real engine closely. Power = torque x rpm / 9549 (kW) x 1.341 (bhp).
+    Negative values mean engine braking.
+    """
+    pct, reference = values.get("Engine torque %"), values.get("Reference torque")
+    if NOT_SUPPORTED in (pct, reference):
+        return {"Torque": NOT_SUPPORTED, "Power": NOT_SUPPORTED}
+    pct, reference, rpm = as_number(pct), as_number(reference), as_number(values.get("RPM"))
+    if pct is None or not reference:
+        return {"Torque": None, "Power": None}
+    torque = pct / 100 * reference
+    return {"Torque": torque, "Power": torque * rpm / 9549 * 1.341 if rpm is not None else None}
+
+
+def heat_values(values):
+    """Heat soak: how much hotter the intake air is than outside (engine-bay heat getting sucked in)."""
+    intake, outside = values.get("Intake air"), values.get("Outside")
+    if NOT_SUPPORTED in (intake, outside):
+        return {"Heat soak": NOT_SUPPORTED}
+    intake, outside = as_number(intake), as_number(outside)
+    return {"Heat soak": intake - outside if intake is not None and outside is not None else None}
+
+
+HOT_ALERTS = {  # coolant/oil alert text -> engine state shown in HEAT (most severe first)
+    "OVERHEATING": {"state": "TOO HOT", "level": "critical", "detail": "ease off / stop safely"},
+    "HOT": {"state": "HOT", "level": "warning", "detail": "ease off"},
+}
+
+
+def hot_state(values):
+    """TOO HOT / HOT from the coolant and oil alert rules, or None while the engine isn't hot.
+    (How far a cold engine has warmed up is the warm-up advisor's job.)"""
+    coolant, oil = as_number(values.get("Coolant")), as_number(values.get("Oil"))
+    triggered = {text for label, value in (("Coolant", coolant), ("Oil", oil)) if value is not None
+                 for test, _, text in next(s for s in STATS if s.label == label).alerts if test(value)}
+    for text, state in HOT_ALERTS.items():
+        if text in triggered:
+            return state
+    return None
+
+
+def speak(sentence):
+    """Say a sentence out loud in the background, so the driver needn't look at the screen.
+
+    Windows' built-in voice (System.Speech via PowerShell); spd-say or espeak elsewhere. Never blocks
+    and never stops the dashboard: if no voice is available, nothing happens.
+    """
+    sentence = sentence.replace("'", "").replace('"', "")
+    if os.name == "nt":
+        command = ["powershell", "-NoProfile", "-Command", "Add-Type -AssemblyName System.Speech; "
+                   f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{sentence}')"]
+    elif shutil.which("spd-say"):
+        command = ["spd-say", sentence]
+    elif shutil.which("espeak"):
+        command = ["espeak", sentence]
+    else:
+        return
+    try:
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console flash on Windows
+    except OSError:
+        pass
+
+
+class PedalCheck:
+    """Cross-checks the two accelerator pedal sensors (PIDs 49 / 4A), like the engine computer does.
+
+    The sensors deliberately don't read the same numbers (different ranges, so one wiring fault
+    can't fool both). Each is rescaled by the range it has shown this drive, and the two rescaled
+    positions must agree. A mismatch has to last HOLD seconds, because the two are read ~40 ms apart
+    and can briefly differ while the pedal is moving. Also stands in for the relative pedal reading
+    (PID 5A) if that ever stops answering.
+    """
+
+    MIN_TRAVEL = 20  # percent a sensor must have moved before its range means anything
+    HOLD = 1.5  # seconds a mismatch must last to count
+
+    def __init__(self):
+        self.ranges = {"D": [math.inf, -math.inf], "E": [math.inf, -math.inf]}
+        self.mismatch_since = None
+        self.reported = None  # mismatch currently shown (points)
+        self.last_pair = None
+
+    def update(self, values):
+        d, e = values.get("Pedal sensor D"), values.get("Pedal sensor E")
+        if NOT_SUPPORTED in (d, e):
+            return {"Pedal sensor mismatch": NOT_SUPPORTED}
+        d, e = as_number(d), as_number(e)
+        out = {"Pedal sensor mismatch": None}
+        if d is None or e is None:
+            return out
+        for key, value in (("D", d), ("E", e)):
+            low, high = self.ranges[key]
+            self.ranges[key] = [min(low, value), max(high, value)]
+        positions = {key: self._position(key, value) for key, value in (("D", d), ("E", e))}
+        if as_number(values.get("Accelerator pedal")) is None and positions["D"] is not None:
+            out["Accelerator pedal"] = positions["D"]  # fallback when PID 5A isn't answering
+        if None in positions.values() or (d, e) == self.last_pair:
+            return {**out, "Pedal sensor mismatch": self._held(None)}
+        self.last_pair = (d, e)
+        out["Pedal sensor mismatch"] = self._held(abs(positions["D"] - positions["E"]))
+        return out
+
+    def _position(self, key, value):
+        low, high = self.ranges[key]
+        return (value - low) / (high - low) * 100 if high - low >= self.MIN_TRAVEL else None
+
+    def _held(self, mismatch):
+        """Report the mismatch only once it has lasted HOLD seconds; until then show it as agreeing."""
+        now = time.time()
+        if mismatch is None:
+            return self.reported
+        if mismatch > 10:
+            self.mismatch_since = self.mismatch_since or now
+            self.reported = mismatch if now - self.mismatch_since >= self.HOLD else min(mismatch, 10.0)
+        else:
+            self.mismatch_since, self.reported = None, mismatch
+        return self.reported
 
 
 class TripComputer:
@@ -434,19 +649,55 @@ class TripComputer:
                 self.sprint_done.add(target)
 
 
+class Trends:
+    """How fast slow values (temperatures) are changing, from the readings of the last minute."""
+
+    WINDOW = 60  # seconds of history to compare against
+    MIN_SPAN = 10  # seconds of history needed before showing a trend
+
+    def __init__(self, labels):
+        self.history = {label: deque() for label in labels}
+
+    def update(self, values):
+        now = time.time()
+        for label, history in self.history.items():
+            value = as_number(values.get(label))
+            if value is None:
+                continue
+            history.append((now, value))
+            while now - history[0][0] > self.WINDOW:
+                history.popleft()
+
+    def per_minute(self):
+        """{label: change per minute}, or None for labels without enough history yet."""
+        rates = {}
+        for label, history in self.history.items():
+            if len(history) < 2 or history[-1][0] - history[0][0] < self.MIN_SPAN:
+                rates[label] = None
+                continue
+            (t0, v0), (t1, v1) = history[0], history[-1]
+            rates[label] = (v1 - v0) / (t1 - t0) * 60
+        return rates
+
+
 # ---------------------------------------------------------------- recording and replay
 
 
 class Recorder:
-    """Saves every raw reading to a CSV file, so a drive can be replayed later with --replay."""
+    """Saves every raw reading to a CSV file: one row per update, with seconds since the start (t)
+    and the clock time. Drive recordings can be played back with --replay.
 
-    def __init__(self):
+    labels: the columns; None takes them from the first row written (used for --all).
+    """
+
+    def __init__(self, path, labels=None):
         os.makedirs(RECORD_DIR, exist_ok=True)
-        self.path = os.path.join(RECORD_DIR, f"drive_{datetime.now():%Y%m%d_%H%M}.csv")
+        self.path = path
         self.file = open(self.path, "w", newline="", encoding="utf-8")
-        self.labels = [s.label for s in STATS if s.command]
         self.writer = csv.writer(self.file)
-        self.writer.writerow(["t"] + self.labels)
+        self.labels = labels
+        if labels is not None:
+            self.writer.writerow(["t", "time"] + labels)
         self.start = time.time()
 
     def write(self, values):
@@ -455,24 +706,27 @@ class Recorder:
                 return ""
             return value if isinstance(value, str) else f"{value:.6g}"
 
-        self.writer.writerow([f"{time.time() - self.start:.2f}"] + [cell(values.get(k)) for k in self.labels])
+        if self.labels is None:
+            self.labels = [k for k in values if not k.startswith("_")]
+            self.writer.writerow(["t", "time"] + self.labels)
+        now = datetime.now().isoformat(sep=" ", timespec="milliseconds")
+        self.writer.writerow([f"{time.time() - self.start:.2f}", now] + [cell(values.get(k)) for k in self.labels])
         self.file.flush()  # keep the file complete even if the laptop sleeps or the script is killed
 
     def close(self):
         self.file.close()
 
 
-def save_profile(connection, trouble):
-    """What this car supports + one reading of everything, for designing without the car."""
+def save_profile(connection, trouble, path):
+    """What this car supports + one reading of everything, saved next to the run's recording."""
     os.makedirs(RECORD_DIR, exist_ok=True)
-    path = os.path.join(RECORD_DIR, "car_profile.json")
     profile = {
         "saved": datetime.now().isoformat(timespec="seconds"),
         "port": connection.port_name(),
         "protocol": connection.protocol_name(),
         "trouble_codes": trouble,
         "supported_commands": sorted(c.name for c in connection.supported_commands if c.mode == 1),
-        "snapshot": read_everything(connection),
+        "snapshot": texts(read_everything(connection)),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(profile, f, indent=2, ensure_ascii=False)
@@ -484,10 +738,16 @@ def replay_reader(path):
     def parse(text):
         if text == "":
             return None
-        return text if text == NOT_SUPPORTED else float(text)
+        try:
+            return float(text)
+        except ValueError:
+            return text  # NOT_SUPPORTED or a text value
 
     with open(path, newline="", encoding="utf-8") as f:
-        frames = [(float(row.pop("t")), {k: parse(v) for k, v in row.items()}) for row in csv.DictReader(f)]
+        rows = list(csv.DictReader(f))
+    for row in rows:
+        row.pop("time", None)  # clock time column (recordings made after 2026-10-13)
+    frames = [(float(row.pop("t")), {k: parse(v) for k, v in row.items()}) for row in rows]
     if not frames:
         raise SystemExit(f"{path} has no readings.")
     state = {"start": time.time(), "i": 0}
@@ -501,6 +761,155 @@ def replay_reader(path):
         return frames[state["i"]][1]
 
     return read
+
+
+# ---------------------------------------------------------------- probe: who's on the network
+
+
+GEAR_PID = 0xA4  # standard "Transmission Actual Gear" (newer OBD-II addition; python-OBD 0.7.3 doesn't know it)
+
+
+def probe(connection):
+    """Read-only scan of every module that answers on the car's network (--probe).
+
+    Asks all modules (not just the engine) which standard live data they support, tries the
+    standard gear PID, reads stored + pending trouble codes and each module's name/software ID.
+    Only standard read requests (services 01, 03, 07, 09) are sent; nothing is written or cleared.
+    """
+    import obd
+    from obd.decoders import parse_dtc
+    from obd.protocols import ECU
+
+    can_11bit = connection.protocol_id() in ("6", "8")
+
+    def address(tx_id):
+        # On 11-bit CAN, module n replies from 7E8 + n; other protocols just report the sender byte.
+        return f"{0x7E8 + tx_id:X}" if can_11bit else f"{tx_id:02X}"
+
+    def ask(request):
+        """Send one request to every module: {reply address: reply bytes (service + PID echo first)}."""
+        def by_module(messages):
+            return {address(m.tx_id): bytes(m.data) for m in messages if m.parsed() and m.tx_id is not None}
+
+        # fast=False: wait for every module to answer, not just the first one.
+        command = obd.OBDCommand(f"PROBE_{request}", f"probe {request}", request.encode(), 0, by_module,
+                                 ECU.ALL, False)
+        return connection.query(command, force=True).value or {}
+
+    def text(data):
+        return data.decode("ascii", errors="ignore").strip("\x00 ").strip() or None
+
+    # Which live-data PIDs each module supports: 0100 lists 01-20, 0120 lists 21-40, and so on.
+    supported = {}
+    for base in range(0x00, 0xE0, 0x20):
+        replies = ask(f"01{base:02X}")
+        for module, data in replies.items():
+            bits = data[2:6]
+            pids = supported.setdefault(module, set())
+            pids.update(base + i + 1 for i in range(len(bits) * 8) if bits[i // 8] & (0x80 >> (i % 8)))
+        if not any(base + 0x20 in pids for pids in supported.values()):
+            break  # nobody supports the next range
+
+    gear_replies = ask(f"01{GEAR_PID:02X}")
+    stored, pending = ask("03"), ask("07")
+    names, calibration = ask("090A"), ask("0904")
+
+    def pid_name(pid):
+        if pid == GEAR_PID:
+            return "Transmission actual gear"
+        if obd.commands.has_pid(1, pid):
+            return obd.commands[1][pid].desc
+        return f"PID {pid:02X} (not in python-OBD)"
+
+    def codes(replies, module):
+        data = replies.get(module, b"")[2:]
+        return [code for code, _ in filter(None, (parse_dtc((data[i], data[i + 1]))
+                                                  for i in range(0, len(data) - 1, 2)))]
+
+    modules = sorted(set(supported) | set(gear_replies) | set(stored) | set(pending) | set(names))
+    report = {
+        "saved": datetime.now().isoformat(timespec="seconds"),
+        "protocol": connection.protocol_name(),
+        "modules": {},
+    }
+    for module in modules:
+        gear_data = gear_replies.get(module)
+        report["modules"][module] = {
+            "usually": {"7E8": "engine", "7E9": "transmission (AMT)"}.get(module, "other module") if can_11bit
+            else "unknown",
+            "name": text(names[module][3:]) if module in names else None,
+            "calibration_id": text(calibration[module][3:]) if module in calibration else None,
+            # pid % 0x20 skips 20, 40, 60...: those only say "the next range is supported"
+            "supported_live_data": [f"{pid:02X} {pid_name(pid)}" for pid in sorted(supported.get(module, ()))
+                                    if pid % 0x20],
+            "gear_pid_a4": None if gear_data is None else {
+                "raw": gear_data[2:].hex(" "),
+                # Ratio per Wikipedia's PID table: (256*C + D) / 1000. Gear position encoding unconfirmed.
+                "gear_ratio": (gear_data[4] * 256 + gear_data[5]) / 1000 if len(gear_data) >= 6 else None,
+            },
+            "stored_codes": codes(stored, module),
+            "pending_codes": codes(pending, module),
+        }
+
+    os.makedirs(RECORD_DIR, exist_ok=True)
+    path = os.path.join(RECORD_DIR, f"probe_{datetime.now():%Y%m%d_%H%M%S}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    return report, path
+
+
+# ---------------------------------------------------------------- gear calibration from recordings
+
+
+def calibrate_gears(recording_dir):
+    """Measure RPM per km/h for each gear from recorded drives (--calibrate-gears).
+
+    While in gear, RPM / speed is fixed by the gearbox, so the readings cluster around one value
+    per gear. Shifting, clutch slip and idling fall between the clusters and are filtered out.
+    """
+    import glob
+    import statistics
+    from collections import Counter
+
+    ratios = []
+    for path in sorted(glob.glob(os.path.join(recording_dir, "drive_*.csv"))):
+        with open(path, encoding="utf-8") as f:
+            previous = None
+            for row in csv.DictReader(f):
+                try:
+                    speed, rpm = float(row["Speed"]), float(row["RPM"])
+                except (KeyError, ValueError):
+                    previous = None
+                    continue
+                steady = previous and abs(previous[0] - speed) <= 2 and abs(previous[1] - rpm) < 250
+                if speed >= 10 and rpm > 900 and steady:
+                    ratios.append(rpm / speed)
+                previous = (speed, rpm)
+    if not ratios:
+        print(f"No usable readings in {recording_dir} (record a drive first).")
+        return
+
+    # Peaks of a histogram on a log scale (gears are spread evenly in log), 2 % wide bins.
+    bins = Counter(round(math.log(r) / 0.02) for r in ratios)
+    floor = max(15, 0.01 * len(ratios))
+    peaks = [math.exp(b * 0.02) for b, n in bins.items()
+             if n >= floor and all(n >= bins.get(b + k, 0) for k in (-2, -1, 1, 2))]
+    measured = sorted((statistics.median([r for r in ratios if abs(math.log(r / p)) < 0.08]) for p in peaks),
+                      reverse=True)
+
+    # Match each measured cluster to the theoretical gear it's closest to; fill unseen gears from theory.
+    by_gear = {}
+    for value in measured:
+        gear = min(range(5), key=lambda i: abs(math.log(value / THEORETICAL_RPM_PER_KMH[i])))
+        by_gear[gear] = round(value, 1)
+    scale = statistics.median(by_gear[g] / THEORETICAL_RPM_PER_KMH[g] for g in by_gear)
+    suggested = [by_gear.get(g, round(THEORETICAL_RPM_PER_KMH[g] * scale, 1)) for g in range(5)]
+
+    print(f"{len(ratios)} in-gear readings from {recording_dir}")
+    for g in range(5):
+        source = "measured" if g in by_gear else f"not driven in this gear: theory x {scale:.3f}"
+        print(f"  gear {g + 1}: {suggested[g]:6.1f} rpm per km/h   ({source})")
+    print(f"\nSuggested line for CAR SETTINGS:\nGEAR_RPM_PER_KMH = {suggested}")
 
 
 # ---------------------------------------------------------------- main loop
@@ -532,7 +941,14 @@ def parse_args():
     parser.add_argument("--all", action="store_true", help="Show every stat your car supports")
     parser.add_argument("--demo", action="store_true", help="Use fake data instead of a car")
     parser.add_argument("--replay", metavar="CSV", help="Play back a recorded drive instead of reading the car")
-    parser.add_argument("--no-record", action="store_true", help="Don't save readings to the recordings folder")
+    parser.add_argument("--refuel", type=float, metavar="LITRES",
+                        help="Litres just put in (from the pump receipt); use at the start of the drive after refuelling")
+    parser.add_argument("--full", action="store_true", help="The tank was filled to the automatic cut-off (full)")
+    parser.add_argument("--mute", action="store_true", help="Don't speak the warm-up messages")
+    parser.add_argument("--calibrate-gears", action="store_true",
+                        help="Measure each gear's RPM per km/h from the recorded drives, then exit")
+    parser.add_argument("--probe", action="store_true",
+                        help="Read-only scan of every module on the car's network (finds AMT data), then exit")
     parser.add_argument(
         "--debug", action="store_true",
         help="Log every message sent to/from the adapter (on screen while connecting, then to obd.log)",
@@ -549,20 +965,41 @@ def main():
     if args.list_ports:
         print_ports()
         return
+    if args.calibrate_gears:
+        calibrate_gears(RECORD_DIR)
+        return
 
-    throttle_history = deque(maxlen=400)
     peaks = {}
     trip = TripComputer()
+    pedals = PedalCheck()
+    trends = Trends([s.label for s in STATS if s.group == "temps"])
+    live = not (args.demo or args.replay)  # only real drives may change the saved fuel state
+    fuel = FuelTracker(TANK_LITRES, ENGINE_LITRES, VOLUMETRIC_EFFICIENCY, FUEL_STATE_PATH if live else None)
+    if args.refuel or args.full:
+        fuel.refuel(args.refuel, args.full)
+    battery = BatteryMonitor(BATTERY_STATE_PATH if live else None)
+    advisor = WarmUpAdvisor()
     header = ""
 
     def dashboard(values, took):
-        """Add trip-computer values, remember peaks and recent throttle, then draw."""
-        values = {**values, **trip.update(values)}
-        throttle_history.append(values.get("Throttle"))
+        """Add trip-computer values, remember peaks, recent throttle and temperature trends, then draw."""
+        values = {**values, **trip.update(values), **engine_output(values), **pedals.update(values),
+                  **heat_values(values)}
+        trends.update(values)
+        fuel.update(values, trip.distance, trip.accel)
+        battery.update(values)
+        advisor.update(values)
+        sentence = advisor.announcement()
+        if sentence and not args.mute:
+            speak(sentence)
+        warm_up = advisor.report()
         for label, value in values.items():
             if as_number(value) is not None:
                 peaks[label] = max(peaks.get(label, value), value)
-        return render_dashboard(STATS, values, peaks, throttle_history, header, took)
+        engine_state = hot_state(values) or warm_up  # hot beats warming up
+        rpm_limit = warm_up["rpm_limit"] if warm_up else None
+        return render_dashboard(STATS, values, peaks, trends.per_minute(), fuel.report(), battery.report(),
+                                engine_state, rpm_limit, header, took)
 
     if args.demo:
         start = time.time()
@@ -578,6 +1015,13 @@ def main():
     connection = connect(args.port, args.protocol)
     if connection is None:
         return
+    if args.probe:
+        print("Probing every module on the car's network (read-only, ~20 s) ...")
+        report, path = probe(connection)
+        connection.close()
+        print_probe_report(report)
+        print(f"\nSaved: {path}")
+        return
     if not car_is_answering(connection):
         print(f"\nThe adapter answered on {connection.port_name()}, but the car's engine computer did not.")
         print("Turn the ignition fully ON (or start the engine), wait ~10s, and run again.")
@@ -586,37 +1030,54 @@ def main():
 
     trouble = trouble_codes(connection)
     header = f"{connection.port_name()} · {connection.protocol_name()} · Trouble codes: {trouble}"
-    recorder = None
-    if not args.no_record and not args.all:
-        print("Saving what this car supports (a few seconds) ...")
-        print(f"  -> {save_profile(connection, trouble)}")
-        recorder = Recorder()
-        print(f"Recording readings to {recorder.path}")
-        header += " · ● REC"
+    # Every real run is recorded, named by date and time (to the second, so runs never overwrite).
+    name = f"{'all' if args.all else 'drive'}_{datetime.now():%Y%m%d_%H%M%S}"
+    print("Saving what this car supports (a few seconds) ...")
+    print(f"  -> {save_profile(connection, trouble, os.path.join(RECORD_DIR, f'{name}_profile.json'))}")
+    labels = None if args.all else [s.label for s in STATS if s.command]  # --all: whatever the car reports
+    recorder = Recorder(os.path.join(RECORD_DIR, f"{name}.csv"), labels)
+    print(f"Recording readings to {recorder.path}")
+    header += " · ● REC"
 
     updates = itertools.count()
     latest = {}
 
     def read_car():
-        """Each stat every `stat.every` updates; in between, its value stays the last reading."""
+        """Each stat every `stat.every` updates; in between, its value stays the last reading.
+
+        While the engine is off, only voltage and RPM are read (plus everything every 20th update),
+        so the dip when the engine is started is sampled ~10 times a second instead of every few.
+        """
         n = next(updates)
-        latest.update(read_stats(connection, [s for s in STATS if s.command and n % s.every == 0]))
-        if recorder:
-            recorder.write(latest)
+        if battery.engine_off() and n % 20:
+            wanted = [s for s in STATS if s.label in ("Battery (port)", "RPM")]
+        else:
+            wanted = [s for s in STATS if s.command and n % s.every == 0]
+        fresh = read_stats(connection, wanted)
+        latest.update(fresh)
+        now = time.time()
+        latest["_read_at"] = {**latest.get("_read_at", {}), **{label: now for label in fresh}}  # for freshness checks
+        recorder.write(latest)
         return dict(latest)
 
     log_to_file()
     print(f"Connected. Adapter messages now go to {LOG_PATH}")
     try:
         if args.all:
-            run(lambda: read_everything(connection), lambda v, took: render_all(v, header, took), args.interval)
+            def read_all_and_record():
+                values = read_everything(connection)
+                recorder.write({label: text if number is None else number
+                                for label, (text, number) in values.items()})
+                return texts(values)
+
+            run(read_all_and_record, lambda v, took: render_all(v, header, took), args.interval)
         else:
             run(read_car, dashboard, args.interval)
     finally:
         connection.close()
-        if recorder:
-            recorder.close()
-            print(f"Drive saved: {recorder.path}")
+        fuel.save()
+        recorder.close()
+        print(f"Run saved: {recorder.path}")
 
 
 if __name__ == "__main__":

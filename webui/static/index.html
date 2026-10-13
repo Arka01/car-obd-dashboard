@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#05070a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Car Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Tap to start: full screen, keep the screen on, unlock the voice (browsers need one tap first) -->
+  <div id="start" class="overlay">
+    <div class="start-card">
+      <div class="slashes"><i></i><i></i><i></i></div>
+      <h1>CAR DASHBOARD</h1>
+      <p>Tap to start</p>
+      <small>full screen · screen stays on · spoken warm-up messages</small>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="brand"><div class="slashes"><i></i><i></i><i></i></div><span>TIAGO</span></div>
+    <div id="header" class="conn">connecting…</div>
+    <div class="topright"><span id="clock"></span><span id="took"></span><span id="link" class="link" title="data link">●</span></div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main class="grid">
+    <!-- HEAT -->
+    <section id="HEAT" class="panel heat">
+      <h2>HEAT</h2>
+      <div id="engine" class="engine-state"></div>
+      <div id="fluids" class="fluids"></div>
+      <div id="temps" class="rows"></div>
+    </section>
+
+    <!-- POWER -->
+    <section id="POWER" class="panel power">
+      <h2>POWER</h2>
+      <div id="leds" class="leds"></div>
+      <div class="rev">
+        <div id="revband" class="revband"></div>
+        <div id="revscale" class="revscale"></div>
+      </div>
+      <div class="cluster">
+        <div class="readout">
+          <label>RPM</label>
+          <div id="rpm" class="num rpm">--</div>
+          <div id="rpmwarn" class="rpmwarn"></div>
+        </div>
+        <div class="gear-wrap">
+          <div class="hex"><span id="gear">-</span></div>
+          <label>GEAR</label>
+        </div>
+        <div class="readout">
+          <label>KM/H</label>
+          <div id="speed" class="num speed">--</div>
+        </div>
+      </div>
+      <div id="output" class="output"></div>
+      <div id="meters" class="meters"></div>
+      <div id="sprint" class="sprint"></div>
+    </section>
+
+    <!-- FUEL -->
+    <section id="FUEL" class="panel fuel">
+      <h2>FUEL</h2>
+      <div class="fuel-left">
+        <label>FUEL LEFT <span id="fuelstatus"></span></label>
+        <div class="num litres"><span id="litres">--</span><small> L</small><span id="sigma" class="sigma"></span></div>
+        <div class="tank"><div id="tankfill" class="tankfill"></div><div id="tankband" class="tankband"></div></div>
+        <div id="sensor" class="muted small"></div>
+      </div>
+      <div class="tiles">
+        <div class="tile"><label>RANGE</label><div><b id="range">--</b> km</div></div>
+        <div class="tile"><label>NOW</label><div><b id="now">--</b> L/100km</div><div class="muted small"><span id="flow">--</span> L/h</div></div>
+        <div class="tile"><label>TRIP</label><div><b id="trip">--</b> L/100km</div><div class="muted small"><span id="used">--</span> L used</div></div>
+      </div>
+      <h3>MIXTURE</h3>
+      <div id="mixture" class="rows mix"></div>
+    </section>
+  </main>
+
+  <footer id="STATUS" class="statusbar">
+    <div id="battery" class="battery"></div>
+    <div id="status" class="status-items"></div>
+    <div id="hint" class="hint"></div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

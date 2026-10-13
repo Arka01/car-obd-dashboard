@@ -7,3 +7,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# fuel tracker state (personal, changes every drive)
+fuel_state.json
+fuel_state.json.tmp
+battery_state.json
+battery_state.json.tmp
