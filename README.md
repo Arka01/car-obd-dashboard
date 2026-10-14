@@ -4,8 +4,10 @@ A race-style dashboard in the terminal, fed live from the car's OBD-II port. It 
 own dashboard doesn't: oil and coolant temperatures, engine internals, live torque and power, fuel
 left in litres, battery and charging health, sprint times and more.
 
-Built for a **2023 Tata Tiago 1.2 petrol AMT** with a **Vgate vLinker MC** (Bluetooth) on **Windows**.
-It works with other OBD-II cars too; anything a car doesn't report is hidden automatically.
+Built for a **2023 Tata Tiago 1.2 petrol AMT** with a **Vgate vLinker MC** (Bluetooth) on **Windows**,
+and works with **any OBD-II car**: each car gets its own folder under `cars\` (settings + recordings),
+set up in one step with `new_car_probe.py` (section 3, "New car"). Anything a car doesn't report is
+hidden automatically.
 
 Everything below works **offline**. Keep this file with the code.
 
@@ -40,16 +42,20 @@ There are **two dashboards** showing the same data — pick one per drive:
   (see section 3, "Web dashboard"). Same options, same recordings and fuel/battery data.
 
 For the terminal dashboard you only ever run **`car_dashboard.py`**; the other files are used by it automatically.
-`COM6` is the vLinker's port on this laptop and `--protocol 6` is the Tiago's (CAN 11-bit, 500 kbaud).
+`COM6` is the vLinker's port on this laptop (it belongs to the adapter, so it's the same in every car).
+The car's **protocol comes from its `car.json`** (the Tiago's is 6, CAN 11-bit 500 kbaud), so
+**`--protocol` is no longer needed** — and leave it out in other cars, which may use a different one.
 
 | I want to… | Command | Needs the car? |
 |---|---|---|
-| **Drive with the dashboard** | `python car_dashboard.py --port COM6 --protocol 6` | Yes |
+| **Drive with the dashboard** | `python car_dashboard.py --port COM6` | Yes |
+| **Set up a new car** (once per car) | `python new_car_probe.py --port COM6` | Yes |
+| Switch to another car that's set up | add `--car <folder name>`, e.g. `--car tata_tiago_2023` (remembered) | — |
 | Try the dashboard with fake data | `python car_dashboard.py --demo` | No |
-| Watch a recorded drive again | `python car_dashboard.py --replay recordings\drive_20261013_1536.csv` | No |
-| **Tell it about a fill-up** (start of the drive after refuelling) | `python car_dashboard.py --port COM6 --protocol 6 --refuel 30.5 --full` | Yes |
-| Scan which modules answer (engine, AMT, …) | `python car_dashboard.py --port COM6 --protocol 6 --probe` | Yes |
-| See every value the car supports, as a table | `python car_dashboard.py --port COM6 --protocol 6 --all` | Yes |
+| Watch a recorded drive again | `python car_dashboard.py --replay cars\tata_tiago_2023\recordings\drive_20261013_1536.csv` | No |
+| **Tell it about a fill-up** (start of the drive after refuelling) | `python car_dashboard.py --port COM6 --refuel 30.5 --full` | Yes |
+| Scan which modules answer (engine, AMT, …) | `python car_dashboard.py --port COM6 --probe` | Yes |
+| See every value the car supports, as a table | `python car_dashboard.py --port COM6 --all` | Yes |
 | Measure the gears from recorded drives | `python car_dashboard.py --calibrate-gears` | No |
 | Find the vLinker's COM port | `python car_dashboard.py --list-ports` | Adapter paired |
 | Troubleshoot the connection | add `--debug` (traffic goes to `obd.log`) | Yes |
@@ -57,7 +63,12 @@ For the terminal dashboard you only ever run **`car_dashboard.py`**; the other f
 | Slow down screen updates (e.g. if it flickers) | add `--interval 0.5` (seconds between updates; default 0.1) | — |
 | List all options | `python car_dashboard.py --help` | No |
 
-Options can be combined, e.g. `--demo --refuel 10` or `--port COM6 --protocol 6 --debug`.
+Options can be combined, e.g. `--demo --refuel 10` or `--port COM6 --debug`. The web dashboard
+(`python webui\server.py`) takes the same `--car`, `--port`, `--refuel`/`--full`, `--demo`, `--replay`, `--mute`.
+
+**Which car?** The dashboards use the car you used last (or the only one set up). In a car whose
+chassis number (VIN) is saved, the right car is picked automatically. A VIN that belongs to no car
+set up here stops the run before anything is recorded, so drives never land in the wrong car's folder.
 
 **Every real run is recorded automatically** (see section 4) — everything except `--demo` (fake data)
 and `--replay` (plays back a recording that already exists). There is no way to switch it off.
@@ -68,17 +79,21 @@ and `--replay` (plays back a recording that already exists). There is no way to 
 
 ### Drive (the normal mode)
 ```powershell
-python car_dashboard.py --port COM6 --protocol 6
+python car_dashboard.py --port COM6
 ```
-Connects (up to ~30 s per attempt), saves what the car supports, then shows the dashboard and records
-every reading (see section 4). The header shows **● REC** while recording.
+Connects (up to ~30 s per attempt), checks it's the right car, saves what the car supports, then shows
+the dashboard and records every reading (see section 4). The header shows the car's name and
+**● REC** while recording.
+
+The first time in a car whose chassis number isn't saved yet, it asks **"Is this the Tata Tiago …? [y/N]"**:
+answer `y` once and it recognises the car from then on.
 
 **On screen:** three sections side by side, a status bar underneath.
 
 | Section | What's in it |
 |---|---|
 | **HEAT** (left) | **Engine state** from the warm-up advisor (`COLD START` → `READY TO MOVE` → `WARMING` → `READY TO PUSH`), or `HOT` / `TOO HOT`; **coolant** and **oil** in big digits with status and trend (`↑ +2.1°/min`, `→ steady`); intake air, outside air, **heat soak** (how much hotter the intake air is than outside — hot air means less power), catalyst |
-| **POWER** (middle) | **Shift lights**: a row of LEDs that light up with RPM — green, amber from 3500, red from 4000 (lower while the engine is cold, see the warm-up advisor); they **blink** at the limit, meaning shift up / ease off. Below them **RPM**, the **estimated gear** in huge digits, and **speed**; **torque** (Nm) and **power** (bhp) with bars; bar meters for throttle, pedal, engine load, manifold pressure and timing; best **0-60 / 0-100** km/h times and acceleration |
+| **POWER** (middle) | **Shift lights**: a row of LEDs that light up with RPM — green, amber from 3500, red from 4000 (set per car in `car.json`; lower while the engine is cold, see the warm-up advisor); they **blink** at the limit, meaning shift up / ease off. Below them **RPM**, the **estimated gear** in huge digits, and **speed**; **torque** (Nm) and **power** (bhp) with bars; bar meters for throttle, pedal, engine load, manifold pressure and timing; best **0-60 / 0-100** km/h times and acceleration |
 | **FUEL** (right) | **FUEL LEFT** in litres with ± and a tank bar (and the tank sensor's own reading); **range** in km; consumption **now** (L/100 km and L/h) and for the **trip** (L/100 km and litres used); **mixture**: lambda and both fuel trims |
 | **STATUS** (bottom) | Battery state and last starting dip; trip distance and average speed; engine run time; air pressure; distance counters; pedal sensor check |
 
@@ -93,11 +108,16 @@ Same data and features as the terminal dashboard, with a sporty motorsport-style
 lights, slanted rev band, RPM / gear / speed, torque and power, bar meters, HEAT / POWER / FUEL /
 STATUS sections that glow red on an alert. Live runs are recorded exactly like the terminal ones.
 
+It works for **any car** straight after `new_car_probe.py`: the panels show what that car reports,
+and the **ALL SENSORS** button (top left) switches to a list of **every value the car reports**,
+grouped into POWER / HEAT / FUEL / OTHER (**DASHBOARD** switches back). Live runs also record
+those extra values.
+
 ```powershell
 python webui\server.py --demo                          # fake data
-python webui\server.py --port COM6 --protocol 6        # live, from the car
-python webui\server.py --replay recordings\drive_20261013_1131.csv
-python webui\server.py --port COM6 --protocol 6 --refuel 30.5 --full   # after a fill-up
+python webui\server.py --port COM6                     # live, from the car
+python webui\server.py --replay cars\tata_tiago_2023\recordings\drive_20261013_1131.csv
+python webui\server.py --port COM6 --refuel 30.5 --full   # after a fill-up
 ```
 It prints the addresses to open, e.g. `http://localhost:8765` (on the laptop) and `http://192.168.x.x:8765`.
 
@@ -114,17 +134,48 @@ full screen + spoken messages).
 Options: `--web-port 8766` if 8765 is taken; `--mute` for no spoken messages; add `?autostart` to the
 address to skip the tap screen (no full screen / voice then). **Ctrl+C** in PowerShell stops the server.
 
+### New car: set it up once
+Plug the adapter into the new car, start the engine (or ignition fully ON), then:
+```powershell
+python new_car_probe.py --port COM6
+```
+It is **read-only** (never clears codes or changes anything) and takes about a minute:
+1. finds the car's protocol by itself and reads its **chassis number (VIN)**; the first 3 characters
+   name the maker (e.g. `MAT` = Tata Motors);
+2. scans every module for what it supports and reads everything once;
+3. asks a few questions — **Enter** keeps the suggestion in [brackets] or skips:
+   car name, fuel, **tank size** (owner's manual), **engine size**, the RPM where the display turns red;
+4. creates `cars\<name>\` and makes it the car the dashboards use.
+
+Then `python webui\server.py --port COM6` shows everything that car reports. What switches on later:
+
+| Feature | Needs | How |
+|---|---|---|
+| Gear display | the car's gears measured | drive through every gear, then `python car_dashboard.py --calibrate-gears` |
+| Fuel left in litres, range | tank size | answer the question, or set `tank_litres` in `car.json` |
+| Backup fuel estimate | engine size, petrol | answer the question, or set `engine_litres` |
+
+Already set up (same VIN)? It only refreshes that car's `probe.json`. Back in your own car, add
+`--car tata_tiago_2023` once (or let the VIN pick it).
+
+**Settings file** `cars\<name>\car.json` — edit with any text editor; `null` = unknown (that feature is
+off). `cars\_template\car.json` explains every setting.
+
+**A car's own web design:** put files in `cars\<name>\ui\` — they replace the ones in
+`webui\static\` for that car only (e.g. copy `style.css` there and change the colours). Files you don't
+copy keep coming from the shared design.
+
 ### Demo
 ```powershell
 python car_dashboard.py --demo
 ```
-Fake car repeating a 40-second accelerate-and-brake cycle. Safe to play with: demo and replay never
+Fake car repeating a 40-second accelerate-and-brake cycle, using the current car's settings. Safe to play with: demo and replay never
 change the saved fuel or battery data. Fuel appears after ~10 s, the 0-60 time after ~40 s, range after
 ~2-3 minutes.
 
 ### Replay a recorded drive
 ```powershell
-python car_dashboard.py --replay recordings\drive_20261013_1536.csv
+python car_dashboard.py --replay cars\tata_tiago_2023\recordings\drive_20261013_1536.csv
 ```
 Plays the drive at its original pace and loops. The header says **REPLAY**. Use it to look at the
 design at home. Drives recorded before a feature existed won't have its values.
@@ -138,7 +189,7 @@ don't have to look at the screen — and lowers the red zone of the shift lights
 | **COLD START** | Right after starting a cold engine (coolant below 70 °C) | "Cold start. Wait for the idle to settle." | 2,000 rpm |
 | **READY TO MOVE** | The fast idle has settled (or after 60 s at most) | "Ready to move. Drive gently." | 2,500 rpm |
 | **WARMING** | Coolant reaches 70 °C | "Engine warming up. Moderate driving." | 3,500 rpm |
-| **READY TO PUSH** | Coolant ≥ 80 °C and oil ≥ 85 °C for a minute | "Engine warm. Full power OK." | normal (4,000) |
+| **READY TO PUSH** | Coolant ≥ 80 °C and oil ≥ 85 °C for a minute | "Engine warm. Full power OK." | normal (`redline_rpm`, 4,000 on the Tiago) |
 
 - Revving above the current limit makes the shift lights blink and shows **✖ KEEP BELOW … RPM: ENGINE COLD**.
 - Starting an already-warm engine skips straight to the right stage, silently.
@@ -149,29 +200,32 @@ don't have to look at the screen — and lowers the red zone of the shift lights
 ### Fuel: after refuelling
 Start the **next drive** with the litres from the pump receipt:
 ```powershell
-python car_dashboard.py --port COM6 --protocol 6 --refuel 30.5 --full   # pump clicked off: tank full
-python car_dashboard.py --port COM6 --protocol 6 --refuel 10            # partial fill
+python car_dashboard.py --port COM6 --refuel 30.5 --full   # pump clicked off: tank full
+python car_dashboard.py --port COM6 --refuel 10            # partial fill
 ```
 - Use `--full` only when the pump clicked off by itself.
 - Forgot? It detects a refuel by itself, just less precisely.
+- Each car has its own fuel memory; a car without `tank_litres` shows the tank sensor's **%** instead.
 - Accuracy: about **±1 L** at first; after **two fills to full** it has learned the tank sensor and the
   fuel-rate correction and gets to about **±0.4 L**.
 
 ### Probe: what modules and data does the car have?
 ```powershell
-python car_dashboard.py --port COM6 --protocol 6 --probe
+python car_dashboard.py --port COM6 --probe
 ```
 ~20-30 s, **read-only** (never clears codes or changes anything). Prints one panel per module
 (on the Tiago: engine `7E8` and AMT `7E9`) with name, software ID, supported data, the gear PID and
-trouble codes, and saves `recordings\probe_<date>_<time>.json`.
+trouble codes, and saves `cars\<car>\recordings\probe_<date>_<time>.json`. (`new_car_probe.py` does
+the same scan for a car that isn't set up yet.)
 
 ### Calibrate the gears
 ```powershell
 python car_dashboard.py --calibrate-gears
 ```
-Reads all recorded drives and prints each gear's RPM per km/h plus a line to paste into the
-settings at the top of `car_dashboard.py` (`GEAR_RPM_PER_KMH = [...]`). Do this after a highway drive:
-so far only 1st-3rd are measured.
+Reads the car's recorded drives, prints each gear's RPM per km/h and asks whether to **save them to
+the car's `car.json`** (add `--yes` to save without asking). Saving switches the gear display on.
+On the Tiago only 1st-3rd are measured so far: run it again after a highway drive. For a car without
+known gear ratios the gears are numbered in order, so the drive must use every gear from 1st up.
 
 ### Battery and charging
 Automatic in drive mode, shown in the bottom line:
@@ -187,33 +241,44 @@ Automatic in drive mode, shown in the bottom line:
 
 | File | What it is | Run it? |
 |---|---|---|
-| `car_dashboard.py` | Main program: car settings (top of file), stats, connection, recording/replay, probe | **Yes — the only one** |
+| `car_dashboard.py` | Main program: stats, connection, recording/replay, probe, gear calibration | **Yes** |
+| `new_car_probe.py` | Sets up a new car: scan + its folder under `cars\` | **Yes — once per car** |
+| `car_profile.py` | Loads a car's settings (`car.json`), picks the car, recognises makers from the VIN | No |
 | `dashboard_design.py` | How it looks: colours, big digits, shift lights, layout | No (used by the main program) |
 | `fuel_tracker.py` | Fuel left in litres from four sources, learns from fill-ups | No |
 | `battery_monitor.py` | Battery/charging state and starting-voltage test | No |
 | `warmup_advisor.py` | Warm-up stages after a cold start, spoken messages, variable redline | No |
 | `webui\server.py` | Web dashboard: reads the car like the terminal one and streams it to the browser | **Yes — instead of `car_dashboard.py`** |
 | `webui\static\` | The web page itself: `index.html`, `style.css` (the look), `app.js` (drawing the data) | No (served by `server.py`) |
+| `cars\<car>\car.json` | That car's settings: tank, engine, red RPM, gears, protocol (with sources in `notes`) | Edit with a text editor |
+| `cars\_template\car.json` | Starting point for new cars; explains every setting | No |
 | `requirements.txt` | Python packages to install | `pip install -r requirements.txt` |
+| `CLAUDE.md`, `.claude\skills\new-car\` | Instructions for the Claude Code AI assistant (see section 7) | No |
+| `LICENSE` | MIT licence: anyone may use and change the code | No |
 
-**Created while you use it** (personal, never uploaded to GitHub). Names carry the date and time the
-run started, e.g. `drive_20261013_153612.csv` = 13 Oct 2026, 15:36:12:
+**Created while you use it** (personal, never uploaded to GitHub), each inside its car's folder
+`cars\<car>\`. Names carry the date and time the run started, e.g. `drive_20261013_153612.csv` =
+13 Oct 2026, 15:36:12:
 
 | File | Made by | What's in it |
 |---|---|---|
-| `recordings\drive_<date>_<time>.csv` | Drive (dashboard) | One row per update: `t` (seconds since start), `time` (clock time), then every value read |
+| `recordings\drive_<date>_<time>.csv` | Drive (both dashboards) | One row per update: `t` (seconds since start), `time` (clock time), then every value read (the web dashboard adds all the car's other values) |
 | `recordings\all_<date>_<time>.csv` | `--all` | Same, with every value the car supports |
 | `recordings\<drive or all>_<date>_<time>_profile.json` | Drive and `--all` | What the car supported in that run + one snapshot of everything |
 | `recordings\probe_<date>_<time>.json` | `--probe` | Every module and what it reports |
+| `probe.json` | `new_car_probe.py` | The first full scan: modules, supported values, VIN, one reading of everything |
+| `vin.txt` | `new_car_probe.py`, first drive | The chassis number, to recognise the car |
 | `fuel_state.json` | Drive | Fuel left and what's been learned (keep it; deleting resets the learning) |
 | `battery_state.json` | Drive | History of starting voltages |
-| `obd.log` | Drive, `--all` | Adapter traffic (detailed with `--debug`) |
+
+Also: `cars\active_car.txt` (the car used last) and `obd.log` in the main folder (adapter traffic,
+detailed with `--debug`).
 
 Open the CSV files in Excel or pandas for analysis; `--replay` works on the `drive_` files.
 Recordings made before 13 Oct 2026 (13:15) have no `time` column and only minute-precision names.
 
-**Settings you might change** (top of `car_dashboard.py`): shift/redline RPM, tank size, gear values,
-and each stat's warning thresholds in the `STATS` list.
+**Settings you might change:** per car in `cars\<car>\car.json` (red/amber RPM, tank size, gears,
+protocol); for every car, each stat's warning thresholds in the `STATS` list in `car_dashboard.py`.
 
 ---
 
@@ -224,7 +289,10 @@ and each stat's warning thresholds in the `STATS` list.
 | `Python was not found` | Run `Set-Alias python "C:\Program Files\Python39\python.exe"` first |
 | Stuck at `Trying COM6…` / `semaphore timeout` | Press the button on the vLinker to wake it; phone Bluetooth off; toggle laptop Bluetooth; re-plug the adapter |
 | Which COM port? | `python car_dashboard.py --list-ports` — use the **outgoing** Bluetooth port |
-| "The adapter answered … but the car's engine computer did not" | Turn the ignition fully ON or start the engine, wait ~10 s, run again |
+| "The adapter answered … but the car's engine computer did not" | Turn the ignition fully ON or start the engine, wait ~10 s, run again. In another car: it may use a different protocol — set it up with `new_car_probe.py` (and don't add `--protocol`) |
+| "This car's chassis number (VIN) doesn't match …" | You're in a different car: `python new_car_probe.py` for a new one, or add `--car <name>` for one that's set up |
+| "Which car? Add --car …" / "No car set up yet" | Several cars set up and none remembered: add `--car <name>`; none at all: run `new_car_probe.py` |
+| No gear shown (just `-`) | The car's gears aren't measured yet: drive through every gear, then `--calibrate-gears` |
 | Screen cut off | Maximise the window; on small windows some detail is dropped automatically |
 | Values look stale or slow | Check "updated in" at the top right; try `--debug` and read `obd.log` |
 | Web page doesn't open on the phone | See **"Phone can't connect"** below (no admin rights: use the USB cable method) |
@@ -263,7 +331,7 @@ the phone).
 2. In PowerShell:
    ```powershell
    & "$HOME\Documents\platform-tools\adb.exe" reverse tcp:8765 tcp:8765
-   python webui\server.py --port COM6 --protocol 6
+   python webui\server.py --port COM6
    ```
 3. On the phone open **`http://localhost:8765`**, turn it sideways, tap once.
 
@@ -277,6 +345,20 @@ Re-run the `adb reverse` line whenever the cable is reconnected. `adb devices` s
 pip install -r requirements.txt
 ```
 Pair the vLinker in Windows Settings → Bluetooth & devices (PIN `1234`), then find its port with
-`--list-ports`.
+`--list-ports`. Other adapters work if Windows gives them a COM port (classic Bluetooth or USB);
+Bluetooth **Low Energy** adapters don't get one and won't work.
+
+---
+
+## 7. Sharing with other car owners
+
+- Anyone can use and change the code (**MIT licence**, see `LICENSE`).
+- What goes to GitHub: the code, each car's `car.json` and its own `ui\` design. What never does:
+  recordings, probe results, VINs, fuel/battery state (they stay on the laptop; see `.gitignore`).
+- A new owner: section 6 to install, then **"New car: set it up once"** above.
+- **With the Claude Code AI assistant:** open the folder in Claude Code and type **`/new-car`** (or
+  "set up my car"). It follows `.claude\skills\new-car\SKILL.md`: asks for the car's details, runs
+  `new_car_probe.py`, explains what the car supports and fills in `car.json`. Project rules for the
+  assistant are in `CLAUDE.md`. The adapter must be paired with the computer Claude runs on.
 
 Built with [python-OBD](https://github.com/brendan-w/python-OBD) and [rich](https://github.com/Textualize/rich).

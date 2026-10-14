@@ -3,8 +3,9 @@ Web dashboard: the same car data as the terminal dashboard, shown in a browser (
 tablet) with a sporty, motorsport-style look.
 
     python webui/server.py --demo                      # fake data
-    python webui/server.py --port COM6 --protocol 6    # live, from the car (recorded, like the terminal one)
-    python webui/server.py --replay recordings\\drive_20261013_1131.csv
+    python webui/server.py                             # live, from the car (recorded, like the terminal one)
+    python webui/server.py --car tata_tiago_2023       # pick the car (remembered for next time)
+    python webui/server.py --replay cars\\tata_tiago_2023\\recordings\\drive_20261013_1131.csv
 
 Then open the address it prints (http://localhost:8765 on the laptop; the http://192.168.x.x:8765 one
 on a phone/tablet connected to the laptop's hotspot or the same Wi-Fi).
@@ -15,6 +16,10 @@ and turns everything into one plain "snapshot" (a dict that becomes JSON). The p
 /stream and receives each snapshot as a Server-Sent Event. Only Python's standard library is used,
 so nothing extra has to be installed and it works offline.
 
+Works for any car: the panels show what the car reports, and ALL SENSORS lists everything else it
+supports. A car can have its own design in cars/<car>/ui/: files there replace the ones in static/
+(e.g. just a style.css), so a new look never touches the shared page.
+
 The logic files (car_dashboard.py, fuel_tracker.py, battery_monitor.py, warmup_advisor.py) are reused
 unchanged. The loop below mirrors car_dashboard.main(); keep the two in step until they're merged.
 """
@@ -22,6 +27,7 @@ unchanged. The loop below mirrors car_dashboard.main(); keep the two in step unt
 import argparse
 import itertools
 import json
+import math
 import os
 import socket
 import sys
@@ -35,11 +41,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))  # the project folder, for the shared logic files
 
 import car_dashboard as car  # noqa: E402  (needs the path above)
+import car_profile  # noqa: E402
 from battery_monitor import BatteryMonitor  # noqa: E402
 from dashboard_design import (  # noqa: E402
     CRITICAL, GOOD, NOT_SUPPORTED, UNIT_LABELS, WARNING, as_number, critical_alerts, status_of,
 )
-from fuel_tracker import FuelTracker  # noqa: E402
 from warmup_advisor import WarmUpAdvisor  # noqa: E402
 
 STATIC = os.path.join(HERE, "static")
@@ -56,6 +62,36 @@ def number_text(stat, value):
     if round(value, stat.decimals) == 0:
         value = 0.0
     return f"{value:,.0f}" if abs(value) >= 1000 else f"{value:.{stat.decimals}f}"
+
+
+def extra_group(label):
+    """Which panel an ALL SENSORS value belongs with, from words in its name."""
+    name = label.lower()
+    if "temp" in name:
+        return "HEAT"
+    if any(w in name for w in ("fuel", "o2", "trim", "equiv", "evap", "purge", "ethanol", "lambda", "catalyst")):
+        return "FUEL"
+    if any(w in name for w in ("throttle", "pedal", "accel", "torque", "load", "rpm", "speed", "pressure",
+                               "air flow", "timing", "egr", "boost", "turbo")):
+        return "POWER"
+    return "OTHER"
+
+
+def extra_text(value, unit):
+    if isinstance(value, str):
+        return value
+    digits = 0 if abs(value) >= 100 or unit == "count" else 1 if abs(value) >= 10 else 2
+    unit = "" if unit == "count" else UNIT_LABELS.get(unit, unit)
+    return f"{value:,.{digits}f}{(' ' + unit) if unit else ''}"
+
+
+def extra_entries(values, units):
+    """Everything in the readings that isn't one of the dashboard's own stats, for ALL SENSORS."""
+    own = {s.label for s in car.STATS}
+    return [{"label": label, "text": None if value is None else extra_text(value, units.get(label)),
+             "group": extra_group(label)}
+            for label, value in sorted(values.items())
+            if label not in own and not label.startswith("_") and label not in ("t", "time")]
 
 
 def stat_entry(stat, value, peaks):
@@ -85,11 +121,13 @@ class Pipeline:
         self.trip = car.TripComputer()
         self.pedals = car.PedalCheck()
         self.trends = car.Trends([s.label for s in car.STATS if s.group == "heat"])
-        self.fuel = FuelTracker(car.TANK_LITRES, car.ENGINE_LITRES, car.VOLUMETRIC_EFFICIENCY,
-                                car.FUEL_STATE_PATH if live else None)
-        if refuel or full:
+        self.fuel = car.fuel_tracker(live)  # None if the car's tank size isn't set
+        if (refuel or full) and self.fuel:
             self.fuel.refuel(refuel, full)
-        self.battery = BatteryMonitor(car.BATTERY_STATE_PATH if live else None)
+        elif refuel or full:
+            print(f"Refuel not saved: set tank_litres in cars/{car.CAR.key}/car.json first.")
+        self.battery = BatteryMonitor(car.CAR.path("battery_state.json") if live else None)
+        self.units = {}  # ALL SENSORS units, filled by the live reader
         self.advisor = WarmUpAdvisor()
         self.peaks = {}
         self.mute = mute
@@ -100,7 +138,8 @@ class Pipeline:
         values = {**values, **self.trip.update(values), **car.engine_output(values), **self.pedals.update(values),
                   **car.heat_values(values)}
         self.trends.update(values)
-        self.fuel.update(values, self.trip.distance, self.trip.accel)
+        if self.fuel:
+            self.fuel.update(values, self.trip.distance, self.trip.accel)
         self.battery.update(values)
         self.advisor.update(values)
         sentence = self.advisor.announcement()
@@ -112,9 +151,11 @@ class Pipeline:
 
         warm_up = self.advisor.report()
         shown = [s for s in car.STATS if values.get(s.label) != NOT_SUPPORTED]
-        fuel, battery = self.fuel.report(), self.battery.report()
+        fuel, battery = self.fuel.report() if self.fuel else None, self.battery.report()
         return {
             "mode": mode,
+            "car": {"key": car.CAR.key, "name": car.CAR.name, "short": car.CAR.short_name,
+                    "tank_known": bool(car.CAR.tank_litres), "gears_known": bool(car.CAR.gears)},
             "header": header,
             "clock": datetime.now().strftime("%H:%M:%S"),
             "took": round(took, 3),
@@ -123,10 +164,11 @@ class Pipeline:
             "hidden": len(car.STATS) - len(shown),
             "trends": self.trends.per_minute(),
             "engine": car.hot_state(values) or warm_up,
-            "rpm": {"shift": car.SHIFT_RPM, "redline": car.REDLINE_RPM,
+            "rpm": {"shift": car.CAR.shift_rpm, "redline": car.CAR.redline_rpm,
                     "limit": warm_up["rpm_limit"] if warm_up else None},
             "fuel": fuel,
             "battery": battery,
+            "extra": extra_entries(values, self.units),
             "alerts": [{"section": section, "text": text}
                        for section, text in critical_alerts(shown, values, battery, fuel)],
             # age lets the page skip messages that are too old to be useful (e.g. opened mid-drive)
@@ -161,9 +203,10 @@ class Feed:
             time.sleep(max(0, interval - took))
 
 
-def live_reader(connection, recorder, battery):
+def live_reader(connection, recorder, battery, extras):
     """Read the car like car_dashboard.main's read_car(): each stat every `stat.every` updates; only
-    voltage + RPM while the engine is off (to catch the starting dip); every reading recorded."""
+    voltage + RPM while the engine is off (to catch the starting dip); every reading recorded.
+    Plus one of the car's other values per update, in turn, for ALL SENSORS (extras: car.ExtraReader)."""
     updates = itertools.count()
     latest = {}
 
@@ -171,9 +214,10 @@ def live_reader(connection, recorder, battery):
         n = next(updates)
         if battery.engine_off() and n % 20:
             wanted = [s for s in car.STATS if s.label in ("Battery (port)", "RPM")]
+            fresh = car.read_stats(connection, wanted)
         else:
             wanted = [s for s in car.STATS if s.command and n % s.every == 0]
-        fresh = car.read_stats(connection, wanted)
+            fresh = {**car.read_stats(connection, wanted), **extras.read()}
         latest.update(fresh)
         now = time.time()
         latest["_read_at"] = {**latest.get("_read_at", {}), **{label: now for label in fresh}}
@@ -187,9 +231,21 @@ def live_reader(connection, recorder, battery):
 
 
 class Handler(SimpleHTTPRequestHandler):
-    """Serves the page from static/ and the live data at /stream (Server-Sent Events)."""
+    """Serves the page and the live data at /stream (Server-Sent Events).
+
+    Files come from the car's own design folder (cars/<car>/ui/) if it has them, else from static/.
+    """
 
     feed = None  # set before the server starts
+    roots = [STATIC]  # folders to look in, first match wins; set before the server starts
+
+    def translate_path(self, path):
+        for root in self.roots:
+            self.directory = root
+            candidate = super().translate_path(path)
+            if os.path.isfile(candidate) or os.path.isfile(os.path.join(candidate, "index.html")):
+                return candidate
+        return candidate  # not found anywhere: the last folder answers "404"
 
     def do_GET(self):
         if self.path.split("?")[0] == "/stream":
@@ -241,10 +297,11 @@ def addresses(http_port):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Web dashboard (motorsport style) for the car's OBD-II data")
+    parser.add_argument("--car", help="Which car (folder name under cars/); remembered for next time")
     parser.add_argument("--demo", action="store_true", help="Use fake data instead of a car")
     parser.add_argument("--replay", metavar="CSV", help="Play back a recorded drive")
     parser.add_argument("--port", help="COM port of the adapter, e.g. COM6; auto-detected if omitted")
-    parser.add_argument("--protocol", help='ELM327 protocol id, e.g. "6"; auto if omitted')
+    parser.add_argument("--protocol", help='ELM327 protocol id, e.g. "6"; default: from car.json, else auto')
     parser.add_argument("--refuel", type=float, metavar="LITRES", help="Litres just put in (pump receipt)")
     parser.add_argument("--full", action="store_true", help="The tank was filled to the automatic cut-off")
     parser.add_argument("--mute", action="store_true", help="Don't speak the warm-up messages")
@@ -253,41 +310,71 @@ def parse_args():
     return parser.parse_args()
 
 
+def fake_extras(t):
+    """A few made-up "other sensors" so the demo shows the ALL SENSORS panel."""
+    values = {"O2 Sensor 2 Voltage": 0.45 + 0.3 * math.sin(t), "Commanded Evaporative Purge": 12.0,
+              "Absolute load value": 31.0 + 5 * math.sin(t / 3), "Fuel System Status": "Closed loop, using oxygen sensor",
+              "Warm-ups since codes cleared": 41.0, "Time since trouble codes cleared": 7310.0}
+    units = {"O2 Sensor 2 Voltage": "V", "Commanded Evaporative Purge": "%", "Absolute load value": "%",
+             "Time since trouble codes cleared": "min"}
+    return values, units
+
+
 def main():
     args = parse_args()
     live = not (args.demo or args.replay)
-    pipeline = Pipeline(live, args.refuel, args.full, args.mute)
+    car.use_car(car_profile.choose(args.car, demo=not live))
     feed = Feed()
     connection = recorder = None
 
     if args.demo:
         start = time.time()
-        read, header, mode, interval = (lambda: car.fake_values(time.time() - start)), "DEMO · fake data", "demo", 0.5
+        pipeline = Pipeline(live, args.refuel, args.full, args.mute)
+        pipeline.units = fake_extras(0)[1]
+
+        def read():
+            t = time.time() - start
+            return {**car.fake_values(t), **fake_extras(t)[0]}
+
+        header, mode, interval = f"DEMO · fake data · {car.CAR.name} settings", "demo", 0.5
     elif args.replay:
+        pipeline = Pipeline(live, args.refuel, args.full, args.mute)
         read = car.replay_reader(args.replay)
         header, mode, interval = f"REPLAY · {os.path.basename(args.replay)}", "replay", 0.2
     else:
-        connection = car.connect(args.port, args.protocol)
+        connection = car.connect(args.port, args.protocol or car.CAR.protocol)
         if connection is None:
             return
         if not car.car_is_answering(connection):
             print("The adapter answered, but the car's engine computer did not. Turn the ignition fully ON.")
+            print(f"(Or this isn't the {car.CAR.name}: set up a new car with  python new_car_probe.py)")
             connection.close()
             return
+        if not car.check_car(connection, args.car):
+            connection.close()
+            return
+        pipeline = Pipeline(live, args.refuel, args.full, args.mute)  # only now: check_car may switch the car
         trouble = car.trouble_codes(connection)
         name = f"drive_{datetime.now():%Y%m%d_%H%M%S}"  # every real run is recorded, like the terminal one
         print("Saving what this car supports (a few seconds) ...")
-        print(f"  -> {car.save_profile(connection, trouble, os.path.join(car.RECORD_DIR, f'{name}_profile.json'))}")
-        recorder = car.Recorder(os.path.join(car.RECORD_DIR, f"{name}.csv"), [s.label for s in car.STATS if s.command])
+        print(f"  -> {car.save_profile(connection, trouble, os.path.join(car.CAR.recordings, f'{name}_profile.json'))}")
+        extras = car.ExtraReader(connection)
+        pipeline.units = extras.units
+        recorder = car.Recorder(os.path.join(car.CAR.recordings, f"{name}.csv"),
+                                [s.label for s in car.STATS if s.command] + extras.labels)
         print(f"Recording readings to {recorder.path}")
         car.log_to_file()
-        read = live_reader(connection, recorder, pipeline.battery)
-        header = f"{connection.port_name()} · {connection.protocol_name()} · codes: {trouble} · ● REC"
+        read = live_reader(connection, recorder, pipeline.battery, extras)
+        header = f"{car.CAR.name} · {connection.port_name()} · {connection.protocol_name()} · codes: {trouble} · ● REC"
         mode, interval = "live", args.interval
 
+    ui = car.CAR.path("ui")
+    Handler.roots = [ui, STATIC] if ui and os.path.isdir(ui) else [STATIC]
+    if len(Handler.roots) > 1:
+        print(f"Using this car's own design from {ui} (missing files come from webui/static)")
     Handler.feed = feed
     try:
-        server = ThreadingHTTPServer(("0.0.0.0", args.web_port), partial(Handler, directory=STATIC))
+        server = ThreadingHTTPServer(("0.0.0.0", args.web_port), partial(Handler, directory=Handler.roots[-1]))
     except OSError:
         print(f"Port {args.web_port} is already in use (is another dashboard still running?). "
               f"Close it, or add --web-port {args.web_port + 1}.")
@@ -311,7 +398,8 @@ def main():
         with feed.changed:
             feed.changed.notify_all()
         server.server_close()
-        pipeline.fuel.save()
+        if pipeline.fuel:
+            pipeline.fuel.save()
         if connection:
             connection.close()
         if recorder:

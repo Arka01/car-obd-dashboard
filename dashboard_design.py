@@ -631,8 +631,8 @@ def print_probe_report(report):
     modules = report["modules"]
     console.print(Text(f"\n{len(modules)} module(s) answered · {report['protocol']}", style="bold"))
     if len(modules) <= 1:
-        console.print(Text("Only one module answered: the AMT's controller doesn't share data over standard "
-                           "OBD-II on this car (its data would need Tata's own codes).", style=WARNING[1]))
+        console.print(Text("Only one module answered: the car's other controllers (e.g. the gearbox) don't share "
+                           "data over standard OBD-II (theirs would need the maker's own codes).", style=WARNING[1]))
     for address, module in modules.items():
         info = Table.grid(padding=(0, 2))
         info.add_column(style=LABEL, no_wrap=True)

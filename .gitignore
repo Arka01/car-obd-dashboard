@@ -1,4 +1,11 @@
-# drive recordings and adapter logs (personal data, regenerated on every run)
+# Per-car data stays on this laptop: recordings, probe results, VIN, fuel/battery state.
+# Only each car's settings (car.json) and its own web design (ui/) are shared.
+cars/*/*
+!cars/*/car.json
+!cars/*/ui/
+cars/active_car.txt
+
+# old location of recordings (before the cars/ folders) and adapter logs
 recordings/
 obd.log
 
@@ -8,7 +15,7 @@ __pycache__/
 .venv/
 venv/
 
-# fuel tracker state (personal, changes every drive)
+# state files from before the cars/ folders
 fuel_state.json
 fuel_state.json.tmp
 battery_state.json

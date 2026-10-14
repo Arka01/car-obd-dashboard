@@ -1,0 +1,28 @@
+{
+  "name": "Tata Tiago 1.2 petrol AMT (2023)",
+  "short_name": "TIAGO",
+  "brand": "Tata Motors",
+  "fuel": "petrol",
+  "protocol": "6",
+  "shift_rpm": 3500,
+  "redline_rpm": 4000,
+  "tank_litres": 35.0,
+  "engine_litres": 1.199,
+  "volumetric_efficiency": 0.85,
+  "gears": {
+    "rpm_per_kmh": [149.6, 79.0, 51.4, 36.6, 28.8],
+    "gear_ratios": [3.73, 2.05, 1.32, 0.94, 0.74],
+    "final_drive": 4.06,
+    "tyre": "175/60 R15"
+  },
+  "notes": {
+    "protocol": "ISO 15765-4 CAN 11 bit 500 kbaud, as used by the phone app and confirmed with the adapter",
+    "redline_rpm": "the owner's chosen limit (not the engine's maximum): shift lights and the RPM band use it",
+    "tank_litres": "Autocar India spec pages",
+    "engine_litres": "1.2 Revotron displacement; used by the backup fuel estimate",
+    "volumetric_efficiency": "rough typical value",
+    "gear_ratios": "Tata doesn't publish them; assumed in an engineering exercise (LinkedIn, Suriaa)",
+    "tyre": "CarWale / CarDekho",
+    "rpm_per_kmh": "gears 1-3 measured from two drives on 2026-10-13 with --calibrate-gears; 4-5 never driven, so theory scaled by the +6.8 % the measured gears came out above it. Re-run --calibrate-gears after a highway drive."
+  }
+}

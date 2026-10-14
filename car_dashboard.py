@@ -1,8 +1,9 @@
 """
 Live OBD-II race-style dashboard for a Vgate vLinker MC (Bluetooth) on Windows.
 Reads live stats from your car and shows what the car's own dashboard doesn't: temperatures,
-engine internals, sprint times and more. Tuned for a 2023 Tata Tiago 1.2 petrol AMT
-(see CAR SETTINGS below); works on any OBD-II car.
+engine internals, sprint times and more. Works on any OBD-II car; each car's own numbers (tank,
+redline, gears...) live in cars/<car>/car.json (see car_profile.py). Set up a new car with
+new_car_probe.py.
 
 This file is the logic: which stats to read, talking to the adapter, the trip computer,
 recording/replay and the main loop. How things look lives in dashboard_design.py.
@@ -20,18 +21,19 @@ One-time setup
 Run
 ---
     python car_dashboard.py                 # auto-find the vLinker's Bluetooth COM port
+    python car_dashboard.py --car tata_tiago_2023   # pick the car (remembered for next time)
     python car_dashboard.py --port COM6     # use a specific port
     python car_dashboard.py --protocol 6    # skip protocol auto-detect (6 = CAN 11 bit, 500 kbaud)
     python car_dashboard.py --all           # every stat your car supports (as a list)
     python car_dashboard.py --demo          # fake data, no car needed
-    python car_dashboard.py --replay recordings/drive_20261009_1915.csv   # play a recorded drive back
+    python car_dashboard.py --replay cars/tata_tiago_2023/recordings/drive_20261013_1131.csv  # play back
     python car_dashboard.py --debug         # log adapter traffic (to obd.log once the dashboard starts)
     python car_dashboard.py --probe         # read-only scan: which modules answer (AMT?) and what they report
     python car_dashboard.py --refuel 30.5 --full   # after a fill-up: litres from the receipt, filled to cut-off
     python car_dashboard.py --calibrate-gears      # measure each gear from the recorded drives
 
-Every real run (anything except --demo and --replay) is recorded in recordings/, named by date and
-time: drive_<date>_<time>.csv (dashboard) or all_<date>_<time>.csv (--all), plus
+Every real run (anything except --demo and --replay) is recorded in cars/<car>/recordings/, named by
+date and time: drive_<date>_<time>.csv (dashboard) or all_<date>_<time>.csv (--all), plus
 drive_<date>_<time>_profile.json with what the car supports, so drives can be analysed and replayed.
 Ctrl+C quits.
 """
@@ -54,7 +56,9 @@ from datetime import datetime
 
 from rich.live import Live
 
+import car_profile
 from battery_monitor import BatteryMonitor
+from car_profile import Car
 from fuel_tracker import FuelTracker
 from warmup_advisor import WarmUpAdvisor
 from dashboard_design import (
@@ -71,30 +75,15 @@ from dashboard_design import (
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RECORD_DIR = os.path.join(HERE, "recordings")
 LOG_PATH = os.path.join(HERE, "obd.log")
-FUEL_STATE_PATH = os.path.join(HERE, "fuel_state.json")  # fuel left + what's been learned, kept between drives
-BATTERY_STATE_PATH = os.path.join(HERE, "battery_state.json")  # history of starting (cranking) voltages
 ATTEMPTS = 2  # Bluetooth links often fail on the first try and work on the next
 
-# ---------------------------------------------------------------- CAR SETTINGS (assumed; tweak for your car)
+# ---------------------------------------------------------------- the car
 
-SHIFT_RPM, REDLINE_RPM = 3500, 4000  # RPM sweep turns amber / red
-TANK_LITRES = 35.0  # Tiago petrol tank (Autocar India spec pages)
-ENGINE_LITRES = 1.199  # 1.2 Revotron displacement; used by the backup fuel estimate
-VOLUMETRIC_EFFICIENCY = 0.85  # how well the engine fills its cylinders; rough typical value
-# Gear estimate. Tata doesn't publish the Tiago's gear ratios; these come from an engineering
-# exercise that assumed them (LinkedIn, Suriaa). Tyre size 175/60 R15 is from CarWale/CarDekho.
-GEAR_RATIOS = [3.73, 2.05, 1.32, 0.94, 0.74]
-FINAL_DRIVE = 4.06
-TYRE_WIDTH_MM, TYRE_PROFILE_PCT, RIM_INCH = 175, 60, 15
-TYRE_CIRCUMFERENCE_M = math.pi * (RIM_INCH * 25.4 + 2 * TYRE_WIDTH_MM * TYRE_PROFILE_PCT / 100) / 1000
-# Engine rpm per 1 km/h in each gear in theory: wheel turns per minute at 1 km/h x gear ratio x final drive.
-THEORETICAL_RPM_PER_KMH = [r * FINAL_DRIVE * (1000 / 60) / TYRE_CIRCUMFERENCE_M for r in GEAR_RATIOS]
-# Measured from two drives on 2026-10-13 with --calibrate-gears: 1st 149.6, 2nd 79.0, 3rd 51.4.
-# Those drives never reached 4th/5th, so those are the theoretical values scaled by the 6.8 % that
-# the measured gears came out above theory. Re-run --calibrate-gears after a highway drive and update.
-GEAR_RPM_PER_KMH = [149.6, 79.0, 51.4, 36.6, 28.8]
+# The car's own numbers (redline, tank, gears...) come from cars/<car>/car.json: main() picks the car
+# and calls use_car(). Until then (and in the demo without any car set up) neutral settings apply.
+CAR = Car()
+DEMO_GEARS = [149.6, 79.0, 51.4, 36.6, 28.8]  # gearbox for the fake data when the car has none (a Tiago's)
 
 
 # ---------------------------------------------------------------- the stats
@@ -124,9 +113,9 @@ class Stat:
 STATS = [
     # --- power: shift lights, RPM / gear / speed, torque/power and sprint times
     Stat("Speed", "SPEED", "km/h", 0, 200, group="power"),
-    Stat("RPM", "RPM", "rpm", 0, REDLINE_RPM + 1000, [  # scale ends 1000 above redline
-        (lambda v: v > REDLINE_RPM, CRITICAL, "REDLINE"),
-        (lambda v: v > SHIFT_RPM, WARNING, "SHIFT"),
+    Stat("RPM", "RPM", "rpm", 0, 5000, [  # scale: use_car() sets it to end 1000 above the redline
+        (lambda v: v > CAR.redline_rpm, CRITICAL, "REDLINE"),
+        (lambda v: v > CAR.shift_rpm, WARNING, "SHIFT"),
     ], group="power"),
     Stat("Gear (estimated)", None, "", 0, 5, fmt=gear_name, group="power"),
 
@@ -209,6 +198,29 @@ STATS = [
         (lambda v: v > 0, WARNING, "LIGHT WAS ON"),
     ], every=10, decimals=0, short="KM W/ CHECK-ENGINE"),
 ]
+
+
+
+
+def stat_named(label):
+    return next(s for s in STATS if s.label == label)
+
+
+def use_car(car):
+    """Switch every calculation to this car's settings (redline, gears, tank...)."""
+    global CAR
+    CAR = car
+    stat_named("RPM").high = car.redline_rpm + 1000  # RPM scale ends 1000 above the redline
+
+
+def fuel_tracker(live):
+    """The fuel-left estimate for this car; None if its tank size isn't set.
+    The backup estimate from the air the engine takes in assumes petrol, so it's off for other fuels."""
+    if not CAR.tank_litres:
+        return None
+    engine = CAR.engine_litres if CAR.fuel == "petrol" else None
+    return FuelTracker(CAR.tank_litres, engine, CAR.volumetric_efficiency,
+                       CAR.path("fuel_state.json") if live else None)
 
 
 # ---------------------------------------------------------------- connecting to the adapter
@@ -297,6 +309,27 @@ def car_is_answering(connection):
     """The adapter can answer while the car's engine computer stays silent ("NO DATA"),
     e.g. with the ignition off or only in accessory mode. Then no live stats are listed."""
     return any(cmd.mode == 1 and not cmd.name.startswith("PIDS_") for cmd in connection.supported_commands)
+
+
+def read_vin(connection):
+    """The car's 17-character chassis number (VIN), or None if it doesn't share it over OBD.
+
+    Read with service 09 PID 02 and decoded here: python-OBD 0.7.3's own VIN decoder drops the last
+    character. Older (non-CAN) cars send it in several messages, each starting 49 02 <n>.
+    """
+    import obd
+    from obd.protocols import ECU
+
+    def characters(messages):
+        return b"".join(bytes(m.data[3:]) for m in messages if len(m.data) > 3)
+
+    response = connection.query(obd.OBDCommand("VIN", "Vehicle ID", b"0902", 0, characters, ECU.ENGINE, False),
+                                force=True)
+    if response.is_null():
+        return None
+    text = response.value.decode("ascii", errors="ignore")
+    vin = re.sub(r"[^A-HJ-NPR-Z0-9]", "", text.upper())[-17:]  # VINs never use I, O or Q
+    return vin if len(vin) == 17 else None
 
 
 def trouble_codes(connection):
@@ -388,6 +421,45 @@ def read_everything(connection):
     return values
 
 
+class ExtraReader:
+    """Everything else the car reports beyond STATS, for the web dashboard's ALL SENSORS panel and the
+    recording. Reads one per update, taking turns, so the main stats stay quick.
+
+    read() gives {description: number or text}; units holds each number's unit ("°C", "kPa"...).
+    """
+
+    def __init__(self, connection):
+        known = {s.command for s in STATS if s.command}
+        self.connection = connection
+        self.commands = sorted((c for c in connection.supported_commands
+                                if c.mode == 1 and not c.name.startswith("PIDS_") and c.name not in known),
+                               key=lambda c: c.pid)
+        self.units = {}
+        self.turn = 0
+
+    @property
+    def labels(self):
+        return [c.desc for c in self.commands]
+
+    def read(self):
+        if not self.commands:
+            return {}
+        cmd = self.commands[self.turn % len(self.commands)]
+        self.turn += 1
+        response = self.connection.query(cmd)
+        if response.is_null():
+            return {cmd.desc: None}
+        value = response.value
+        if hasattr(value, "magnitude"):
+            self.units[cmd.desc] = f"{value.units:~}"
+            return {cmd.desc: float(value.magnitude)}
+        text = describe(value)
+        if text is None:  # too complex to show (bit fields): stop asking for it
+            self.commands.remove(cmd)
+            return {}
+        return {cmd.desc: text}
+
+
 def texts(values):
     """{description: text} from read_everything's {description: (text, number)}."""
     return {label: text for label, (text, _) in values.items()}
@@ -420,7 +492,8 @@ def fake_values(t):
         speed = 110 * (x / 20) ** 0.8 if accelerating else 110 * (1 - (x - 20) / 20)
     gear = sum(speed > s for s in (0.5, 20, 35, 55, 75))  # 0 = stopped
     fast_idle = max(0.0, 380 - t * 12)  # cold start: idle starts high and settles
-    rpm = 860 + fast_idle if gear == 0 else max(900, speed * GEAR_RPM_PER_KMH[gear - 1]) + random.uniform(-40, 40)
+    gears = CAR.gears or DEMO_GEARS
+    rpm = 860 + fast_idle if gear == 0 else max(900, speed * gears[min(gear, len(gears)) - 1]) + random.uniform(-40, 40)
     throttle = 55 + random.uniform(-5, 5) if accelerating else (0 if x is None else 3)
     return {
         "Speed": speed,
@@ -459,7 +532,11 @@ def fake_values(t):
 
 
 def estimate_gear(speed, rpm):
-    """Gear from the RPM-to-speed ratio; None while shifting (ratio matches no gear), 0 when stopped."""
+    """Gear from the RPM-to-speed ratio; None while shifting (ratio matches no gear), 0 when stopped.
+    NOT_SUPPORTED if this car's gears aren't known yet (run --calibrate-gears after a drive)."""
+    gears = CAR.gears
+    if not gears:
+        return NOT_SUPPORTED
     if speed is None or rpm is None:
         return None
     if speed < 5:
@@ -467,8 +544,8 @@ def estimate_gear(speed, rpm):
     if rpm <= 0:  # engine off / stalled while rolling: no gear to estimate
         return None
     ratio = rpm / speed
-    best = min(range(len(GEAR_RPM_PER_KMH)), key=lambda i: abs(math.log(ratio / GEAR_RPM_PER_KMH[i])))
-    return best + 1 if abs(math.log(ratio / GEAR_RPM_PER_KMH[best])) < 0.15 else None
+    best = min(range(len(gears)), key=lambda i: abs(math.log(ratio / gears[i])))
+    return best + 1 if abs(math.log(ratio / gears[best])) < 0.15 else None
 
 
 def engine_output(values):
@@ -508,7 +585,7 @@ def hot_state(values):
     (How far a cold engine has warmed up is the warm-up advisor's job.)"""
     coolant, oil = as_number(values.get("Coolant")), as_number(values.get("Oil"))
     triggered = {text for label, value in (("Coolant", coolant), ("Oil", oil)) if value is not None
-                 for test, _, text in next(s for s in STATS if s.label == label).alerts if test(value)}
+                 for test, _, text in stat_named(label).alerts if test(value)}
     for text, state in HOT_ALERTS.items():
         if text in triggered:
             return state
@@ -691,7 +768,7 @@ class Recorder:
     """
 
     def __init__(self, path, labels=None):
-        os.makedirs(RECORD_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         self.path = path
         self.file = open(self.path, "w", newline="", encoding="utf-8")
         self.writer = csv.writer(self.file)
@@ -719,8 +796,9 @@ class Recorder:
 
 def save_profile(connection, trouble, path):
     """What this car supports + one reading of everything, saved next to the run's recording."""
-    os.makedirs(RECORD_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     profile = {
+        "car": CAR.key,
         "saved": datetime.now().isoformat(timespec="seconds"),
         "port": connection.port_name(),
         "protocol": connection.protocol_name(),
@@ -769,8 +847,18 @@ def replay_reader(path):
 GEAR_PID = 0xA4  # standard "Transmission Actual Gear" (newer OBD-II addition; python-OBD 0.7.3 doesn't know it)
 
 
-def probe(connection):
-    """Read-only scan of every module that answers on the car's network (--probe).
+def probe(connection, folder):
+    """--probe: scan every module (see scan_modules) and save the report as probe_<date>_<time>.json."""
+    report = scan_modules(connection)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"probe_{datetime.now():%Y%m%d_%H%M%S}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    return report, path
+
+
+def scan_modules(connection):
+    """Read-only scan of every module that answers on the car's network.
 
     Asks all modules (not just the engine) which standard live data they support, tries the
     standard gear PID, reads stored + pending trouble codes and each module's name/software ID.
@@ -835,7 +923,7 @@ def probe(connection):
     for module in modules:
         gear_data = gear_replies.get(module)
         report["modules"][module] = {
-            "usually": {"7E8": "engine", "7E9": "transmission (AMT)"}.get(module, "other module") if can_11bit
+            "usually": {"7E8": "engine", "7E9": "transmission"}.get(module, "other module") if can_11bit
             else "unknown",
             "name": text(names[module][3:]) if module in names else None,
             "calibration_id": text(calibration[module][3:]) if module in calibration else None,
@@ -850,35 +938,32 @@ def probe(connection):
             "stored_codes": codes(stored, module),
             "pending_codes": codes(pending, module),
         }
-
-    os.makedirs(RECORD_DIR, exist_ok=True)
-    path = os.path.join(RECORD_DIR, f"probe_{datetime.now():%Y%m%d_%H%M%S}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-    return report, path
+    return report
 
 
 # ---------------------------------------------------------------- gear calibration from recordings
 
 
-def calibrate_gears(recording_dir):
-    """Measure RPM per km/h for each gear from recorded drives (--calibrate-gears).
+def calibrate_gears(car, save_without_asking=False):
+    """Measure RPM per km/h for each gear from the car's recorded drives (--calibrate-gears).
 
     While in gear, RPM / speed is fixed by the gearbox, so the readings cluster around one value
     per gear. Shifting, clutch slip and idling fall between the clusters and are filtered out.
+    The result can be saved to the car's car.json, which turns on the gear estimate.
     """
     import glob
     import statistics
+    import sys
     from collections import Counter
 
     ratios = []
-    for path in sorted(glob.glob(os.path.join(recording_dir, "drive_*.csv"))):
+    for path in sorted(glob.glob(os.path.join(car.recordings, "drive_*.csv"))):
         with open(path, encoding="utf-8") as f:
             previous = None
             for row in csv.DictReader(f):
                 try:
                     speed, rpm = float(row["Speed"]), float(row["RPM"])
-                except (KeyError, ValueError):
+                except (KeyError, ValueError, TypeError):
                     previous = None
                     continue
                 steady = previous and abs(previous[0] - speed) <= 2 and abs(previous[1] - rpm) < 250
@@ -886,7 +971,7 @@ def calibrate_gears(recording_dir):
                     ratios.append(rpm / speed)
                 previous = (speed, rpm)
     if not ratios:
-        print(f"No usable readings in {recording_dir} (record a drive first).")
+        print(f"No usable readings in {car.recordings} (record a drive first).")
         return
 
     # Peaks of a histogram on a log scale (gears are spread evenly in log), 2 % wide bins.
@@ -897,22 +982,80 @@ def calibrate_gears(recording_dir):
     measured = sorted((statistics.median([r for r in ratios if abs(math.log(r / p)) < 0.08]) for p in peaks),
                       reverse=True)
 
-    # Match each measured cluster to the theoretical gear it's closest to; fill unseen gears from theory.
-    by_gear = {}
-    for value in measured:
-        gear = min(range(5), key=lambda i: abs(math.log(value / THEORETICAL_RPM_PER_KMH[i])))
-        by_gear[gear] = round(value, 1)
-    scale = statistics.median(by_gear[g] / THEORETICAL_RPM_PER_KMH[g] for g in by_gear)
-    suggested = [by_gear.get(g, round(THEORETICAL_RPM_PER_KMH[g] * scale, 1)) for g in range(5)]
+    theory = car.theoretical_rpm_per_kmh
+    print(f"{len(ratios)} in-gear readings from {car.recordings}")
+    if theory:
+        # Match each measured cluster to the theoretical gear it's closest to; fill unseen gears from theory.
+        by_gear = {}
+        for value in measured:
+            gear = min(range(len(theory)), key=lambda i: abs(math.log(value / theory[i])))
+            by_gear[gear] = round(value, 1)
+        scale = statistics.median(by_gear[g] / theory[g] for g in by_gear)
+        suggested = [by_gear.get(g, round(theory[g] * scale, 1)) for g in range(len(theory))]
+        for g in range(len(theory)):
+            source = "measured" if g in by_gear else f"not driven in this gear: theory x {scale:.3f}"
+            print(f"  gear {g + 1}: {suggested[g]:6.1f} rpm per km/h   ({source})")
+    else:
+        # No gear ratios known for this car: number the clusters in order. Only right if the drive
+        # used every gear from 1st up; a skipped gear shifts the numbers.
+        suggested = [round(v, 1) for v in measured]
+        for g, value in enumerate(suggested):
+            print(f"  gear {g + 1}: {value:6.1f} rpm per km/h   (measured)")
+        print("  (numbered in order: check the drive used every gear from 1st, none skipped)")
 
-    print(f"{len(ratios)} in-gear readings from {recording_dir}")
-    for g in range(5):
-        source = "measured" if g in by_gear else f"not driven in this gear: theory x {scale:.3f}"
-        print(f"  gear {g + 1}: {suggested[g]:6.1f} rpm per km/h   ({source})")
-    print(f"\nSuggested line for CAR SETTINGS:\nGEAR_RPM_PER_KMH = {suggested}")
+    if car.folder is None:
+        return
+    if not save_without_asking:
+        if not sys.stdin.isatty():
+            print(f"\nNot saved. Run again with --yes to save to cars/{car.key}/car.json.")
+            return
+        if not confirm(f"\nSave these to cars/{car.key}/car.json? [y/N] "):
+            print("Not saved.")
+            return
+    car.gear_rpm_per_kmh = suggested
+    car_profile.save(car)
+    print(f"Saved to cars/{car.key}/car.json: the gear estimate now uses them.")
 
 
 # ---------------------------------------------------------------- main loop
+
+
+def confirm(question):
+    """Yes/no question in the terminal; always "no" when nobody can answer (e.g. run by a script)."""
+    import sys
+
+    if not sys.stdin.isatty():
+        return False
+    return input(question).strip().lower() in ("y", "yes")
+
+
+def check_car(connection, requested):
+    """Make sure readings go to the right car's folder, using the chassis number (VIN) when the car shares it.
+
+    A car with a saved VIN is switched to automatically. A VIN that belongs to no car set up here stops
+    the run, so another car's drive never lands in this car's recordings. If the current car has no VIN
+    saved yet, it learns this one (with --car, or after asking), so it's recognised from then on.
+    """
+    vin = read_vin(connection)
+    if not vin:
+        return True  # this car doesn't share its VIN: trust --car / the remembered car
+    known = car_profile.match_vin(vin)
+    if known and known != CAR.key:
+        print(f"Recognised this car by its chassis number: {known} (switching from {CAR.key}).")
+        use_car(car_profile.load(known))
+        car_profile.remember(known)
+        return True
+    if known:
+        return True
+    if CAR.folder and not CAR.vin and (requested or confirm(f"Is this the {CAR.name}? [y/N] ")):
+        with open(CAR.path("vin.txt"), "w", encoding="utf-8") as f:
+            f.write(vin + "\n")
+        print(f"Saved this car's chassis number to {CAR.key}, to recognise it next time.")
+        return True
+    print(f"\nThis car's chassis number (VIN) doesn't match {CAR.key} or any other car set up here.")
+    print("  New car?   python new_car_probe.py")
+    print(f"  Known car? add --car <name>   (set up: {', '.join(car_profile.all_cars())})")
+    return False
 
 
 def run(read, render, interval):
@@ -931,8 +1074,10 @@ def run(read, render, interval):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Show live OBD-II car stats")
+    parser.add_argument("--car", help="Which car (folder name under cars/); remembered for next time")
     parser.add_argument("--port", help="COM port of the adapter, e.g. COM6; auto-detected if omitted")
-    parser.add_argument("--protocol", help='ELM327 protocol id, e.g. "6" for CAN 11 bit 500 kbaud; auto if omitted')
+    parser.add_argument("--protocol",
+                        help='ELM327 protocol id, e.g. "6" for CAN 11 bit 500 kbaud; default: from car.json, else auto')
     parser.add_argument(
         "--interval", type=float, default=0.1,
         help="Minimum seconds between refreshes (default 0.1; real rate is limited by how fast the car answers)",
@@ -946,7 +1091,8 @@ def parse_args():
     parser.add_argument("--full", action="store_true", help="The tank was filled to the automatic cut-off (full)")
     parser.add_argument("--mute", action="store_true", help="Don't speak the warm-up messages")
     parser.add_argument("--calibrate-gears", action="store_true",
-                        help="Measure each gear's RPM per km/h from the recorded drives, then exit")
+                        help="Measure each gear's RPM per km/h from the car's recorded drives, then exit")
+    parser.add_argument("--yes", action="store_true", help="With --calibrate-gears: save without asking")
     parser.add_argument("--probe", action="store_true",
                         help="Read-only scan of every module on the car's network (finds AMT data), then exit")
     parser.add_argument(
@@ -965,19 +1111,22 @@ def main():
     if args.list_ports:
         print_ports()
         return
+    live = not (args.demo or args.replay)  # only real drives may change saved state
+    use_car(car_profile.choose(args.car, demo=not live or args.calibrate_gears))
     if args.calibrate_gears:
-        calibrate_gears(RECORD_DIR)
+        calibrate_gears(CAR, args.yes)
         return
 
     peaks = {}
     trip = TripComputer()
     pedals = PedalCheck()
-    trends = Trends([s.label for s in STATS if s.group == "temps"])
-    live = not (args.demo or args.replay)  # only real drives may change the saved fuel state
-    fuel = FuelTracker(TANK_LITRES, ENGINE_LITRES, VOLUMETRIC_EFFICIENCY, FUEL_STATE_PATH if live else None)
-    if args.refuel or args.full:
+    trends = Trends([s.label for s in STATS if s.group == "heat"])
+    fuel = fuel_tracker(live)
+    if (args.refuel or args.full) and fuel:
         fuel.refuel(args.refuel, args.full)
-    battery = BatteryMonitor(BATTERY_STATE_PATH if live else None)
+    elif args.refuel or args.full:
+        print(f"Refuel not saved: set tank_litres in cars/{CAR.key}/car.json first.")
+    battery = BatteryMonitor(CAR.path("battery_state.json") if live else None)
     advisor = WarmUpAdvisor()
     header = ""
 
@@ -986,7 +1135,8 @@ def main():
         values = {**values, **trip.update(values), **engine_output(values), **pedals.update(values),
                   **heat_values(values)}
         trends.update(values)
-        fuel.update(values, trip.distance, trip.accel)
+        if fuel:
+            fuel.update(values, trip.distance, trip.accel)
         battery.update(values)
         advisor.update(values)
         sentence = advisor.announcement()
@@ -998,12 +1148,12 @@ def main():
                 peaks[label] = max(peaks.get(label, value), value)
         engine_state = hot_state(values) or warm_up  # hot beats warming up
         rpm_limit = warm_up["rpm_limit"] if warm_up else None
-        return render_dashboard(STATS, values, peaks, trends.per_minute(), fuel.report(), battery.report(),
-                                engine_state, rpm_limit, header, took)
+        return render_dashboard(STATS, values, peaks, trends.per_minute(), fuel.report() if fuel else None,
+                                battery.report(), engine_state, rpm_limit, header, took)
 
     if args.demo:
         start = time.time()
-        header = "DEMO (fake data) · Trouble codes: none"
+        header = f"DEMO (fake data) · {CAR.name} settings · Trouble codes: none"
         run(lambda: fake_values(time.time() - start), dashboard, max(args.interval, 0.5))
         return
 
@@ -1012,12 +1162,12 @@ def main():
         run(replay_reader(args.replay), dashboard, max(args.interval, 0.2))
         return
 
-    connection = connect(args.port, args.protocol)
+    connection = connect(args.port, args.protocol or CAR.protocol)
     if connection is None:
         return
     if args.probe:
         print("Probing every module on the car's network (read-only, ~20 s) ...")
-        report, path = probe(connection)
+        report, path = probe(connection, CAR.recordings)
         connection.close()
         print_probe_report(report)
         print(f"\nSaved: {path}")
@@ -1025,17 +1175,21 @@ def main():
     if not car_is_answering(connection):
         print(f"\nThe adapter answered on {connection.port_name()}, but the car's engine computer did not.")
         print("Turn the ignition fully ON (or start the engine), wait ~10s, and run again.")
+        print(f"(Or this isn't the {CAR.name}: set up a new car with  python new_car_probe.py)")
+        connection.close()
+        return
+    if not check_car(connection, args.car):
         connection.close()
         return
 
     trouble = trouble_codes(connection)
-    header = f"{connection.port_name()} · {connection.protocol_name()} · Trouble codes: {trouble}"
+    header = f"{CAR.name} · {connection.port_name()} · {connection.protocol_name()} · Trouble codes: {trouble}"
     # Every real run is recorded, named by date and time (to the second, so runs never overwrite).
     name = f"{'all' if args.all else 'drive'}_{datetime.now():%Y%m%d_%H%M%S}"
     print("Saving what this car supports (a few seconds) ...")
-    print(f"  -> {save_profile(connection, trouble, os.path.join(RECORD_DIR, f'{name}_profile.json'))}")
+    print(f"  -> {save_profile(connection, trouble, os.path.join(CAR.recordings, f'{name}_profile.json'))}")
     labels = None if args.all else [s.label for s in STATS if s.command]  # --all: whatever the car reports
-    recorder = Recorder(os.path.join(RECORD_DIR, f"{name}.csv"), labels)
+    recorder = Recorder(os.path.join(CAR.recordings, f"{name}.csv"), labels)
     print(f"Recording readings to {recorder.path}")
     header += " · ● REC"
 
@@ -1075,7 +1229,8 @@ def main():
             run(read_car, dashboard, args.interval)
     finally:
         connection.close()
-        fuel.save()
+        if fuel:
+            fuel.save()
         recorder.close()
         print(f"Run saved: {recorder.path}")
 

@@ -20,7 +20,8 @@
   </div>
 
   <header class="topbar">
-    <div class="brand"><div class="slashes"><i></i><i></i><i></i></div><span>TIAGO</span></div>
+    <div class="brand"><div class="slashes"><i></i><i></i><i></i></div><span id="brand">CAR</span></div>
+    <button id="view" class="tab" type="button">ALL SENSORS</button>
     <div id="header" class="conn">connecting…</div>
     <div class="topright"><span id="clock"></span><span id="took"></span><span id="link" class="link" title="data link">●</span></div>
   </header>
@@ -69,7 +70,7 @@
       <h2>FUEL</h2>
       <div class="fuel-left">
         <label>FUEL LEFT <span id="fuelstatus"></span></label>
-        <div class="num litres"><span id="litres">--</span><small> L</small><span id="sigma" class="sigma"></span></div>
+        <div class="num litres"><span id="litres">--</span><small id="litresunit"> L</small><span id="sigma" class="sigma"></span></div>
         <div class="tank"><div id="tankfill" class="tankfill"></div><div id="tankband" class="tankband"></div></div>
         <div id="sensor" class="muted small"></div>
       </div>
@@ -82,6 +83,12 @@
       <div id="mixture" class="rows mix"></div>
     </section>
   </main>
+
+  <!-- ALL SENSORS: every value the car reports, grouped; the ALL SENSORS / DASHBOARD tab switches views -->
+  <section id="ALL" class="panel all hidden">
+    <h2>ALL SENSORS <span id="allcount" class="muted"></span></h2>
+    <div id="allgroups" class="allgroups"></div>
+  </section>
 
   <footer id="STATUS" class="statusbar">
     <div id="battery" class="battery"></div>

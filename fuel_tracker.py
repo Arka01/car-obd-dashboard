@@ -252,7 +252,7 @@ class FuelTracker:
     def _air_flow_lph(self, values):
         """Fuel needed for the air the engine takes in (speed-density: pressure x volume / temperature)."""
         pressure, rpm = _number(values.get("Manifold pressure")), _number(values.get("RPM"))
-        if pressure is None or rpm is None:
+        if pressure is None or rpm is None or not self.engine_litres:  # engine size unknown: no backup
             return None
         intake = _number(values.get("Intake air"))
         kelvin = (intake if intake is not None else 25) + 273.15

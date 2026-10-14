@@ -56,6 +56,10 @@ label { color: var(--muted); font-size: clamp(11px, 1.1vw, 15px); display: block
 .conn { color: var(--muted); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: .04em; }
 .topright { display: flex; gap: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .link { color: var(--good); } .link.down { color: var(--crit); }
+.tab { font: inherit; font-weight: 900; font-style: italic; letter-spacing: 0.14em; color: var(--text); cursor: pointer;
+  background: #16161a; border: 0; border-left: 3px solid var(--accent); padding: 5px 14px 5px 12px;
+  clip-path: polygon(0 0, 100% 0, calc(100% - 8px) 100%, 0 100%); }
+.tab:active { background: #232329; }
 
 .banner {
   background: var(--crit); color: #fff; font-weight: 900; font-style: italic; letter-spacing: 0.1em;
@@ -189,7 +193,8 @@ label { color: var(--muted); font-size: clamp(11px, 1.1vw, 15px); display: block
 .tank.low .tankfill { background: var(--warn); } .tank.reserve .tankfill { background: var(--crit); }
 .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .tile { background: #16161a; padding: 8px 10px; font-size: clamp(11px, 1.15vw, 14px); color: var(--muted);
-  clip-path: polygon(8px 0, 100% 0, calc(100% - 8px) 100%, 0 100%); }
+  clip-path: polygon(8px 0, 100% 0, calc(100% - 8px) 100%, 0 100%);
+  min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }  /* long words never push tiles out */
 .tile b { color: var(--text); font-style: italic; font-size: clamp(18px, 2vw, 28px); }
 .rows.mix { grid-template-columns: auto auto 1fr; }
 .rows.mix .rextra { display: flex; align-items: center; gap: 8px; }
@@ -206,6 +211,17 @@ label { color: var(--muted); font-size: clamp(11px, 1.1vw, 15px); display: block
 .status-items { display: flex; flex-wrap: wrap; gap: 6px 20px; }
 .status-items span { color: var(--muted); letter-spacing: 0.1em; font-weight: 900; margin-right: 5px; }
 .hint { margin-left: auto; color: var(--muted); font-size: 0.85em; }
+
+/* ---------- ALL SENSORS view: replaces the three panels while open */
+body.show-all .grid { display: none; }
+.all { flex: 1; overflow-y: auto; }
+.allgroups { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 18px; align-items: start; }
+.allgroups h3 { margin: 2px 0 6px; }
+.allgroups .item { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 5px 10px;
+  background: #141418; margin-bottom: 4px; clip-path: polygon(6px 0, 100% 0, calc(100% - 6px) 100%, 0 100%); }
+.allgroups .item span { color: var(--muted); font-size: clamp(11px, 1.05vw, 14px); letter-spacing: 0.04em; }
+.allgroups .item b { font-style: italic; font-size: clamp(14px, 1.5vw, 20px); white-space: nowrap; text-align: right; }
+.allgroups .item b.long { font-size: clamp(11px, 1.05vw, 14px); white-space: normal; }
 
 /* ---------- start overlay */
 .overlay { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; background: rgba(3,3,4,0.94); cursor: pointer; }
@@ -242,4 +258,7 @@ label { color: var(--muted); font-size: clamp(11px, 1.1vw, 15px); display: block
   .litres { font-size: 46px; white-space: nowrap; }
   .tiles { grid-template-columns: 1fr 1fr 1fr; gap: 4px; } .tile { padding: 4px 6px; } .tile b { font-size: 16px; }
   .statusbar { padding: 4px 12px; font-size: 11px; gap: 2px 14px; }
+  .tab { padding: 3px 10px; }
+  .allgroups { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 4px 12px; }
+  .allgroups .item { padding: 3px 8px; margin-bottom: 2px; }
 }

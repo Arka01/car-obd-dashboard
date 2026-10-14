@@ -32,6 +32,13 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && wakeLock !== null) keepScreenOn();
 });
 
+// ALL SENSORS / DASHBOARD tab
+$("view").addEventListener("click", () => {
+  const all = document.body.classList.toggle("show-all");
+  $("ALL").classList.toggle("hidden", !all);
+  $("view").textContent = all ? "DASHBOARD" : "ALL SENSORS";
+});
+
 // ---------------------------------------------------------------- data
 const stream = new EventSource("/stream");
 stream.onmessage = (event) => {
@@ -142,6 +149,8 @@ function build(s) {
 function render(s) {
   if (!built) build(s);
   const st = s.stats;
+  $("brand").textContent = s.car.short;
+  document.title = `${s.car.short} · Car Dashboard`;
   $("header").textContent = s.header;
   $("clock").textContent = s.clock;
   $("took").textContent = `updated in ${s.took.toFixed(2)}s`;
@@ -156,7 +165,23 @@ function render(s) {
   renderPower(s, st);
   renderFuel(s, st);
   renderStatus(s, st);
+  if (!$("ALL").classList.contains("hidden")) renderAll(s, st);
   speak(s.say);
+}
+
+// Every value the car reports: the dashboard's own stats plus everything else, grouped like the panels.
+const PANEL_OF = { power: "POWER", meters: "POWER", heat: "HEAT", mixture: "FUEL", fuel: "FUEL", status: "OTHER" };
+function renderAll(s, st) {
+  const groups = { POWER: [], HEAT: [], FUEL: [], OTHER: [] };
+  for (const x of Object.values(st)) {
+    groups[PANEL_OF[x.group] || "OTHER"].push({ label: x.label, text: x.text !== null ? `${x.text} ${x.unit}` : null });
+  }
+  for (const x of s.extra) groups[x.group].push(x);
+  const count = Object.values(groups).reduce((n, g) => n + g.length, 0);
+  $("allcount").textContent = `· ${count} values from this car`;
+  $("allgroups").innerHTML = Object.entries(groups).filter(([, items]) => items.length).map(([name, items]) =>
+    `<div><h3>${name}</h3>${items.map((x) => `<div class="item"><span>${x.label}</span>` +
+      `<b class="${x.text && x.text.length > 18 ? "long" : ""}">${x.text ?? "--"}</b></div>`).join("")}</div>`).join("");
 }
 
 function renderHeat(s, st) {
@@ -248,7 +273,15 @@ function setVBar(bar, stat) {
 function renderFuel(s, st) {
   const f = s.fuel;
   const ready = f && f.litres !== null;
-  $("litres").textContent = ready ? f.litres.toFixed(1) : "--";
+  if (!s.car.tank_known) { // no tank size in car.json: show the tank sensor's % instead of litres
+    const level = st["Fuel level"];
+    $("litres").textContent = level && level.value !== null ? level.value.toFixed(0) : "--";
+    $("litresunit").textContent = " %";
+    $("tankfill").style.width = level && level.value !== null ? pct(frac(level.value, 0, 100)) : "0";
+    $("sensor").textContent = "tank size not set: add tank_litres to car.json for litres and range";
+  } else {
+    $("litres").textContent = ready ? f.litres.toFixed(1) : "--";
+  }
   $("sigma").textContent = ready ? `±${(f.sigma || 0).toFixed(1)}` : "";
   const tank = document.querySelector(".tank");
   tank.classList.toggle("low", ready && f.litres < 8 && f.litres >= 4);
@@ -261,9 +294,9 @@ function renderFuel(s, st) {
     $("tankband").style.left = pct(frac(f.litres - sig, 0, t));
     $("tankband").style.width = pct(frac(f.litres + sig, 0, t) - frac(f.litres - sig, 0, t));
   }
-  $("sensor").textContent = ready && f.sensor_litres !== null ? `tank sensor ${f.sensor_litres.toFixed(1)} L (${f.sensor_pct.toFixed(0)}%)` : "";
+  if (s.car.tank_known) $("sensor").textContent = ready && f.sensor_litres !== null ? `tank sensor ${f.sensor_litres.toFixed(1)} L (${f.sensor_pct.toFixed(0)}%)` : "";
   $("range").textContent = f ? fixed(f.range_km, 0) : "--";
-  $("now").textContent = f ? (f.now_l_per_100km === null ? "stopped" : fixed(f.now_l_per_100km)) : "--";
+  $("now").textContent = f ? (f.now_l_per_100km === null ? "stop" : fixed(f.now_l_per_100km)) : "--";
   $("flow").textContent = f ? fixed(f.flow_lph) : "--";
   $("trip").textContent = f ? fixed(f.trip_l_per_100km) : "--";
   $("used").textContent = f ? fixed(f.used_trip, 2) : "--";
