@@ -42,6 +42,7 @@ class Car:
     gear_ratios: list = None  # from the maker's specs, if known: gives a first guess before calibrating
     final_drive: float = None
     tyre: str = None  # e.g. "175/60 R15"
+    spec: dict = None  # maker's peak torque / power, for comparison: torque_nm, torque_rpm, power_bhp, power_rpm
     folder: str = None  # None: nothing is saved (demo)
     settings: dict = field(default_factory=dict)  # car.json as loaded, to save it back unchanged
 
@@ -96,7 +97,7 @@ def load(key):
     car = Car(key=key, folder=folder, settings=settings,
               **{k: settings[k] for k in FIELDS if settings.get(k) is not None},
               gear_rpm_per_kmh=gears.get("rpm_per_kmh"), gear_ratios=gears.get("gear_ratios"),
-              final_drive=gears.get("final_drive"), tyre=gears.get("tyre"))
+              final_drive=gears.get("final_drive"), tyre=gears.get("tyre"), spec=settings.get("spec"))
     if car.protocol is not None:
         car.protocol = str(car.protocol)
     return car
@@ -159,6 +160,16 @@ def choose(requested=None, demo=False):
     if not cars:
         raise SystemExit("No car set up yet. Plug the adapter into the car and run:  python new_car_probe.py")
     raise SystemExit(f"Which car? Add --car with one of: {', '.join(cars)}")
+
+
+def car_of_recording(path):
+    """The car a recording belongs to, from its folder (cars/<car>/recordings/...), or None."""
+    parts = os.path.normpath(os.path.abspath(path)).split(os.sep)
+    if "recordings" in parts:
+        i = len(parts) - 1 - parts[::-1].index("recordings")
+        if i >= 2 and parts[i - 2] == "cars" and parts[i - 1] in all_cars():
+            return parts[i - 1]
+    return None
 
 
 def match_vin(vin):

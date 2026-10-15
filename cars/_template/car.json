@@ -15,6 +15,12 @@
     "final_drive": null,
     "tyre": null
   },
+  "spec": {
+    "torque_nm": null,
+    "torque_rpm": null,
+    "power_bhp": null,
+    "power_rpm": null
+  },
   "notes": {
     "about": "new_car_probe.py fills this in. null = unknown: whatever needs it is switched off, everything else still works.",
     "protocol": "ELM327 protocol id found by the probe, e.g. \"6\"; null = auto-detect each time (slower to connect)",
@@ -22,6 +28,7 @@
     "tank_litres": "from the owner's manual; needed for fuel left in litres and range",
     "engine_litres": "engine size, e.g. 1.199 for 1199 cc; petrol only: backup fuel estimate from the air taken in",
     "gears.rpm_per_kmh": "filled by  python car_dashboard.py --calibrate-gears  after a drive through every gear; turns on the gear display",
-    "gears.gear_ratios / final_drive / tyre": "optional maker specs, e.g. tyre \"175/60 R15\": give a gear guess before calibrating"
+    "gears.gear_ratios / final_drive / tyre": "optional maker specs, e.g. tyre \"175/60 R15\": give a gear guess before calibrating",
+    "spec": "optional: the maker's published peak torque and power (with rpm); marked on the DYNO graph for comparison"
   }
 }

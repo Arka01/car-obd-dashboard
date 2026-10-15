@@ -104,7 +104,7 @@ answer `y` once and it recognises the car from then on.
 
 | Section | What's in it |
 |---|---|
-| **HEAT** (left) | **Engine state** from the warm-up advisor (`COLD START` → `READY TO MOVE` → `WARMING` → `READY TO PUSH`), or `HOT` / `TOO HOT`; **coolant** and **oil** in big digits with status and trend (`↑ +2.1°/min`, `→ steady`); intake air, outside air, **heat soak** (how much hotter the intake air is than outside — hot air means less power), catalyst |
+| **HEAT** (left) | **Engine state** from the warm-up advisor (`COLD START` → `READY TO MOVE` → `WARMING` → `READY TO PUSH`), or `HOT` / `TOO HOT`; **coolant** and **oil** in big digits with status and trend (`↑ +2.1°/min`, `→ steady`); **AIR TO ENGINE** (intake air), **OUTSIDE AIR**, **ENGINE-BAY HEAT** (how much hotter the air going into the engine is than outside — hot air means less power), **CAT CONVERTER** (exhaust catalytic converter; cleans the exhaust once above ~300 °C) |
 | **POWER** (middle) | **Shift lights**: a row of LEDs that light up with RPM — green, amber from 3500, red from 4000 (set per car in `car.json`; lower while the engine is cold, see the warm-up advisor); they **blink** at the limit, meaning shift up / ease off. Below them **RPM**, the **estimated gear** in huge digits, and **speed**; **torque** (Nm) and **power** (bhp) with bars; bar meters for throttle, pedal, engine load, manifold pressure and timing; best **0-60 / 0-100** km/h times and acceleration |
 | **FUEL** (right) | **FUEL LEFT** in litres with ± and a tank bar (and the tank sensor's own reading); **range** in km; consumption **now** (L/100 km and L/h) and for the **trip** (L/100 km and litres used); **mixture**: lambda and both fuel trims |
 | **STATUS** (bottom) | Battery state and last starting dip; trip distance and average speed; engine run time; air pressure; distance counters; pedal sensor check |
@@ -124,6 +124,32 @@ It works for **any car** straight after `new_car_probe.py`: the panels show what
 and the **ALL SENSORS** button (top left) switches to a list of **every value the car reports**,
 grouped into POWER / HEAT / FUEL / OTHER (**DASHBOARD** switches back). Live runs also record
 those extra values.
+
+**DYNO** button (cars that report torque, e.g. the Tiago): one full-screen chart of **torque** (white, Nm,
+left scale) **and power** (grey, bhp, right scale) over the **last 2 minutes**, newest on the right where the
+dots draw the lines (like a strip chart). The current torque and power are big numbers in the top-right
+corner. The **maker's peak figures** from the car's `car.json` (`spec`; Tiago: 113 Nm @ 3,300 rpm,
+84 bhp @ 6,000 rpm) are faint dashed red lines with a red circle and label on the left. The status bar is
+hidden here, so the chart gets the whole screen.
+
+Every drive recording also saves **Torque** (Nm) and **Power** (bhp) next to **RPM**, so a proper
+torque & power vs RPM graph (like a real dyno sheet) can be drawn from any drive afterwards — best from a
+full-throttle pull. Recordings made before 15 Oct 2026 evening have the raw values instead
+("Engine torque %" × "Reference torque").
+
+The numbers are the engine computer's own torque estimate (power is worked out from it), not a dyno
+measurement; only **full throttle** gets near the maker's lines.
+
+**What a full-throttle run looks like** (simulated, not recorded):
+```powershell
+python webui\server.py --replay samples\simulated_full_throttle_tiago.csv --car tata_tiago_2023
+```
+Cruising at 30 km/h, then floored at 10 s: the AMT kicks down to 2nd, pulls to 6,000 rpm, shifts to 3rd
+(~1 s with no torque while the clutch is open), pulls to 6,000 rpm again (~117 km/h), then lifts off
+(engine braking: the Tiago's engine computer then reports 0, never negative, so torque and power read 0). Torque touches the maker's 113 Nm line, power reaches 84 bhp at 6,000 rpm.
+It's a physics model (car ~1,100 kg with driver, the measured gear ratios, drag and rolling resistance);
+only the two peak figures are Tata's — **the torque curve between them is assumed**. It goes past the
+4,000 rpm redline on purpose, to show the whole curve. Every column matches a real drive recording.
 
 ```powershell
 python webui\server.py --demo                          # fake data
@@ -225,7 +251,8 @@ change the saved fuel or battery data. Fuel appears after ~10 s, the 0-60 time a
 ```powershell
 python car_dashboard.py --replay cars\tata_tiago_2023\recordings\drive_20261013_1536.csv
 ```
-Plays the drive at its original pace and loops. The header says **REPLAY**. Use it to look at the
+Plays the drive at its original pace and loops. The header says **REPLAY**. It uses the settings and
+design of the car the recording belongs to (from its folder); `--car` overrides that. Use it to look at the
 design at home. Drives recorded before a feature existed won't have its values.
 
 ### Warm-up advisor (automatic)
@@ -310,7 +337,7 @@ Automatic in drive mode, shown in the bottom line:
 
 | File | Made by | What's in it |
 |---|---|---|
-| `recordings\drive_<date>_<time>.csv` | Drive (both dashboards) | One row per update: `t` (seconds since start), `time` (clock time), then every value read (the web dashboard adds all the car's other values) |
+| `recordings\drive_<date>_<time>.csv` | Drive (both dashboards) | One row per update: `t` (seconds since start), `time` (clock time), then every value read, plus calculated **Torque** (Nm) and **Power** (bhp) (the web dashboard adds all the car's other values) |
 | `recordings\all_<date>_<time>.csv` | `--all` | Same, with every value the car supports |
 | `recordings\<drive or all>_<date>_<time>_profile.json` | Drive and `--all` | What the car supported in that run + one snapshot of everything |
 | `recordings\probe_<date>_<time>.json` | `--probe` | Every module and what it reports |

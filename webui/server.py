@@ -169,6 +169,7 @@ class Pipeline:
             "fuel": fuel,
             "battery": battery,
             "extra": extra_entries(values, self.units),
+            "dyno": {"spec": car.CAR.spec},  # DYNO view: the maker's peak torque and power, for comparison
             "alerts": [{"section": section, "text": text}
                        for section, text in critical_alerts(shown, values, battery, fuel)],
             # age lets the page skip messages that are too old to be useful (e.g. opened mid-drive)
@@ -221,7 +222,7 @@ def live_reader(connection, recorder, battery, extras, multi=None):
         latest.update(fresh)
         now = time.time()
         latest["_read_at"] = {**latest.get("_read_at", {}), **{label: now for label in fresh}}
-        recorder.write(latest)
+        recorder.write(car.recording_row(latest))  # raw readings + torque and power
         return dict(latest)
 
     return read
@@ -252,6 +253,12 @@ class Handler(SimpleHTTPRequestHandler):
             return self.stream()
         return super().do_GET()
 
+    def end_headers(self):
+        # Never let the browser reuse a cached page: the same address shows a different car's design
+        # depending on which car the server is started for.
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def stream(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -273,6 +280,16 @@ class Handler(SimpleHTTPRequestHandler):
 
     def log_message(self, *args):
         pass  # keep the console quiet
+
+
+class QuietServer(ThreadingHTTPServer):
+    """The web server, minus the scary tracebacks when a browser hangs up mid-request (a reload, a closed tab,
+    or a spare connection the browser opened and dropped, e.g. "WinError 10053"). Those are normal."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def addresses(http_port):
@@ -325,7 +342,9 @@ def fake_extras(t):
 def main():
     args = parse_args()
     live = not (args.demo or args.replay)
-    car.use_car(car_profile.choose(args.car, demo=not live))
+    # a replay uses the car the recording belongs to (its folder), unless --car says otherwise
+    requested = args.car or (car_profile.car_of_recording(args.replay) if args.replay else None)
+    car.use_car(car_profile.choose(requested, demo=not live))
     feed = Feed()
     connection = recorder = None
 
@@ -365,7 +384,7 @@ def main():
         extras = car.ExtraReader(connection)
         pipeline.units = extras.units
         recorder = car.Recorder(os.path.join(car.CAR.recordings, f"{name}.csv"),
-                                [s.label for s in car.STATS if s.command] + extras.labels)
+                                [s.label for s in car.STATS if s.command] + car.RECORDED_CALCULATED + extras.labels)
         print(f"Recording readings to {recorder.path}")
         car.log_to_file()
         read = live_reader(connection, recorder, pipeline.battery, extras, multi)
@@ -380,7 +399,7 @@ def main():
         print(f"Using this car's own design from {ui} (missing files come from webui/static)")
     Handler.feed = feed
     try:
-        server = ThreadingHTTPServer(("0.0.0.0", args.web_port), partial(Handler, directory=Handler.roots[-1]))
+        server = QuietServer(("0.0.0.0", args.web_port), partial(Handler, directory=Handler.roots[-1]))
     except OSError:
         print(f"Port {args.web_port} is already in use (is another dashboard still running?). "
               f"Close it, or add --web-port {args.web_port + 1}.")

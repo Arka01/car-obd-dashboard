@@ -131,17 +131,18 @@ STATS = [
         (lambda v: v > 120, WARNING, "HOT"),
         (lambda v: v < 60, WARNING, "COLD"),  # go easy until oil is warm
     ], every=10, group="heat", decimals=0),
-    Stat("Intake air", "INTAKE_TEMP", "degC", -20, 80, short="INTAKE", alerts=[
+    # short = the name shown on screen (the label stays the same: it names the column in recordings)
+    Stat("Intake air", "INTAKE_TEMP", "degC", -20, 80, short="AIR TO ENGINE", alerts=[
         (lambda v: v > 60, WARNING, "HOT AIR"),  # heat soak: less power
     ], every=10, group="heat", decimals=0),
-    Stat("Outside", "AMBIANT_AIR_TEMP", "degC", -20, 50, every=10, group="heat", decimals=0),
+    Stat("Outside", "AMBIANT_AIR_TEMP", "degC", -20, 50, every=10, group="heat", decimals=0, short="OUTSIDE AIR"),
     Stat("Heat soak", None, "degC", -10, 40, [  # intake air minus outside air: hot air in = less power
         (lambda v: v > 25, WARNING, "HOT INTAKE"),
-    ], group="heat", fmt=lambda v: f"{v:+.0f} °C"),
+    ], group="heat", fmt=lambda v: f"{v:+.0f} °C", short="ENGINE-BAY HEAT"),
     Stat("Catalyst", "CATALYST_TEMP_B1S1", "degC", 0, 1000, [
         (lambda v: v > 900, CRITICAL, "TOO HOT"),
         (lambda v: v < 300, WARNING, "COLD"),  # cleans exhaust only once hot
-    ], every=10, group="heat", decimals=0),
+    ], every=10, group="heat", decimals=0, short="CAT CONVERTER"),
 
     # --- bar meters in POWER, and the air-fuel mixture (shown in FUEL)
     # Relative versions (PIDs 45 / 5A) are rescaled to a true 0-100 %; the plain ones never drop below ~10-15 %.
@@ -240,8 +241,9 @@ PHASES = read_phases(STATS)
 
 
 def due(n):
-    """The stats to read in update number n (speed and RPM are in every update)."""
-    return [s for s in STATS if s.command and (n + PHASES.get(s.label, 0)) % s.every == 0]
+    """The stats to read in update number n (speed and RPM are in every update). The first update reads
+    everything once, so slow stats (e.g. the reference torque, every 50th) don't leave gaps at the start."""
+    return [s for s in STATS if s.command and (n == 0 or (n + PHASES.get(s.label, 0)) % s.every == 0)]
 
 
 def use_car(car):
@@ -681,7 +683,7 @@ class MultiReader:
         """(values, asked): values from the groups due in update n, and the labels those groups were asked for."""
         values, asked = {}, set()
         for group in self.groups:
-            if group["off"] or (n + group["phase"]) % group["every"]:
+            if group["off"] or (n and (n + group["phase"]) % group["every"]):  # all groups in update 0
                 continue
             asked.update(group["labels"])
             got = self._ask(group)
@@ -823,6 +825,16 @@ def engine_output(values):
         return {"Torque": None, "Power": None}
     torque = pct / 100 * reference
     return {"Torque": torque, "Power": torque * rpm / 9549 * 1.341 if rpm is not None else None}
+
+
+# Calculated values saved in every drive recording too (not only the raw readings), so a dyno-style
+# torque & power vs RPM graph can be drawn straight from the file.
+RECORDED_CALCULATED = ["Torque", "Power"]
+
+
+def recording_row(latest):
+    """What goes into the recording for one update: the raw readings plus torque (Nm) and power (bhp)."""
+    return {**latest, **engine_output(latest)}
 
 
 def heat_values(values):
@@ -1386,7 +1398,9 @@ def main():
         print_ports()
         return
     live = not (args.demo or args.replay)  # only real drives may change saved state
-    use_car(car_profile.choose(args.car, demo=not live or args.calibrate_gears))
+    # a replay uses the car the recording belongs to (its folder), unless --car says otherwise
+    requested = args.car or (car_profile.car_of_recording(args.replay) if args.replay else None)
+    use_car(car_profile.choose(requested, demo=not live or args.calibrate_gears))
     if args.calibrate_gears:
         calibrate_gears(CAR, args.yes)
         return
@@ -1466,7 +1480,8 @@ def main():
     print("Saving what this car supports (a few seconds) ...")
     notes = {"fast_read": multi.note} if multi else None
     print(f"  -> {save_profile(connection, trouble, os.path.join(CAR.recordings, f'{name}_profile.json'), notes)}")
-    labels = None if args.all else [s.label for s in STATS if s.command]  # --all: whatever the car reports
+    # --all: whatever the car reports; otherwise every stat read from the car plus torque and power
+    labels = None if args.all else [s.label for s in STATS if s.command] + RECORDED_CALCULATED
     recorder = Recorder(os.path.join(CAR.recordings, f"{name}.csv"), labels)
     print(f"Recording readings to {recorder.path}")
     header += " · ● REC"
@@ -1489,7 +1504,7 @@ def main():
         latest.update(fresh)
         now = time.time()
         latest["_read_at"] = {**latest.get("_read_at", {}), **{label: now for label in fresh}}  # for freshness checks
-        recorder.write(latest)
+        recorder.write(recording_row(latest))
         return dict(latest)
 
     log_to_file()

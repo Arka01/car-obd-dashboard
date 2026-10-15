@@ -22,6 +22,7 @@
   <header class="topbar">
     <div class="brand"><div class="slashes"><i></i><i></i><i></i></div><span id="brand">CAR</span></div>
     <button id="view" class="tab" type="button">ALL SENSORS</button>
+    <button id="dynobtn" class="tab hidden" type="button">DYNO</button>
     <div id="header" class="conn">connecting…</div>
     <div class="topright"><span id="clock"></span><span id="took"></span><span id="link" class="link" title="data link">●</span></div>
   </header>
@@ -83,6 +84,16 @@
       <div id="mixture" class="rows mix"></div>
     </section>
   </main>
+
+  <!-- DYNO: torque and power against RPM, like a dyno sheet (only for cars that report torque) -->
+  <section id="DYNO" class="panel dyno hidden">
+    <h2>DYNO · TORQUE &amp; POWER</h2>
+    <div class="dchart"><label>last 2 minutes</label><canvas id="dynotime"></canvas></div>
+    <div class="dynonote">
+      <span><i class="key t"></i>TORQUE (Nm)</span><span><i class="key p"></i>POWER (bhp)</span><span><i class="key spec"></i>MAKER'S FIGURE</span>
+      <span class="muted">Newest on the right · the engine computer's estimate, not a dyno measurement · only full throttle reaches the maker's figures</span>
+    </div>
+  </section>
 
   <!-- ALL SENSORS: every value the car reports, grouped; the ALL SENSORS / DASHBOARD tab switches views -->
   <section id="ALL" class="panel all hidden">

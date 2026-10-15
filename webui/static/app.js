@@ -36,12 +36,19 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && wakeLock !== null) keepScreenOn();
 });
 
-// ALL SENSORS / DASHBOARD tab
-$("view").addEventListener("click", () => {
-  const all = document.body.classList.toggle("show-all");
-  $("ALL").classList.toggle("hidden", !all);
-  $("view").textContent = all ? "DASHBOARD" : "ALL SENSORS";
-});
+// Views: the dashboard, ALL SENSORS or DYNO. Each tab opens its view, or goes back to the dashboard.
+let currentView = "dash";
+function showView(view) {
+  currentView = view;
+  document.body.classList.toggle("show-all", view === "all");
+  document.body.classList.toggle("show-dyno", view === "dyno");
+  $("ALL").classList.toggle("hidden", view !== "all");
+  $("DYNO")?.classList.toggle("hidden", view !== "dyno");
+  $("view").textContent = view === "all" ? "DASHBOARD" : "ALL SENSORS";
+  if ($("dynobtn")) $("dynobtn").textContent = view === "dyno" ? "DASHBOARD" : "DYNO";
+}
+$("view").addEventListener("click", () => showView(currentView === "all" ? "dash" : "all"));
+$("dynobtn")?.addEventListener("click", () => showView(currentView === "dyno" ? "dash" : "dyno"));
 
 // ---------------------------------------------------------------- data
 const stream = new EventSource("/stream");
@@ -172,8 +179,131 @@ function render(s) {
   if ($("FUEL")) renderFuel(s, st);
   renderStatus(s, st);
   if (!$("ALL").classList.contains("hidden")) renderAll(s, st);
+  if ($("DYNO")) updateDyno(s, st);
   if (window.extraRender) window.extraRender(s);
   speak(s.say);
+}
+
+// ---------------------------------------------------------------- DYNO view
+// A strip chart of torque and power over the last 2 minutes, newest on the right where the dots draw the
+// lines, the current values as big numbers in the top-right corner and the maker's peak figures as red lines.
+const TIME_WINDOW = 120;  // seconds shown
+const timeline = [];      // [{t, torque, power}]
+
+function updateDyno(s, st) {
+  const has = st.Torque && st.Power;
+  $("dynobtn").classList.toggle("hidden", !has);
+  if (!has) return;
+  const value = (stat) => (stat && stat.value !== null && stat.value !== undefined ? stat.value : null);
+  const now = Date.now() / 1000;
+  timeline.push({ t: now, torque: value(st.Torque), power: value(st.Power) });
+  while (timeline.length && now - timeline[0].t > TIME_WINDOW) timeline.shift();
+  if (currentView === "dyno") drawDyno(s, st, now);
+}
+
+// A canvas sized to its box in real pixels (sharp on phones), cleared, with the theme colours.
+function chart(id) {
+  const c = $(id), ratio = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w * ratio) || c.height !== Math.round(h * ratio)) { c.width = Math.round(w * ratio); c.height = Math.round(h * ratio); }
+  const g = c.getContext("2d");
+  g.setTransform(ratio, 0, 0, ratio, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return { g, w, h, L: 46, R: 46, T: 12, B: 24, white: css("--text"), silver: css("--fill-2"), muted: css("--muted"),
+           accent: css("--accent"), crit: css("--crit") };
+}
+
+// The time axis (-120 s ... now) with faint grid lines; returns the x mapper.
+function timeAxis(c, now) {
+  const { g, w, h, L, R, T, B } = c;
+  const x = (t) => L + (1 - (now - t) / TIME_WINDOW) * (w - L - R);
+  g.font = "italic 800 11px sans-serif"; g.lineWidth = 1;
+  for (let k = 0; k <= TIME_WINDOW; k += 30) {
+    const px = x(now - k);
+    g.strokeStyle = "#1c1c22"; g.beginPath(); g.moveTo(px, T); g.lineTo(px, h - B); g.stroke();
+    // the two end labels sit inside the chart so they don't run into the unit labels
+    g.fillStyle = c.muted; g.textAlign = k === 0 ? "right" : k === TIME_WINDOW ? "left" : "center";
+    g.fillText(k ? `-${k}s` : "now", px + (k === 0 ? -4 : k === TIME_WINDOW ? 4 : 0), h - 6);
+  }
+  g.textAlign = "left";
+  return x;
+}
+
+// One value scale in 4 equal steps: labels on the left or right edge, horizontal grid lines; returns the y mapper.
+function valueScale(c, max, side, colour, unit, grid = true) {
+  const { g, w, h, L, R, T, B } = c;
+  const y = (v) => h - B - (Math.min(Math.max(v, 0), max) / max) * (h - T - B);
+  const ticks = [0, 1, 2, 3, 4].map((i) => (max * i) / 4);
+  g.font = "italic 800 11px sans-serif"; g.lineWidth = 1;
+  const at = side === "left" ? 8 : w - R + 8;
+  for (const v of ticks) {
+    if (grid) { g.strokeStyle = "#1c1c22"; g.beginPath(); g.moveTo(L, y(v)); g.lineTo(w - R, y(v)); g.stroke(); }
+    g.fillStyle = colour; g.fillText(String(Math.round(v)), at, y(v) + 4);
+  }
+  g.fillStyle = colour; g.fillText(unit, at, h - 6);
+  return y;
+}
+
+// A line through the timeline for one key, ending in a dot at the newest reading (the "pen").
+function trace(c, x, y, key, colour) {
+  const { g } = c;
+  g.strokeStyle = colour; g.lineWidth = 2.5; g.beginPath();
+  let drawing = false, last = null;
+  for (const p of timeline) {
+    if (p[key] === null) { drawing = false; continue; }  // gaps where there was no reading
+    drawing ? g.lineTo(x(p.t), y(p[key])) : g.moveTo(x(p.t), y(p[key]));
+    drawing = true; last = p;
+  }
+  g.stroke();
+  if (last) { g.fillStyle = colour; g.beginPath(); g.arc(x(last.t), y(last[key]), 6, 0, 2 * Math.PI); g.fill(); }
+}
+
+// Big numbers stacked in the top-right corner: [[value, unit, colour], ...].
+function cornerNumbers(c, rows) {
+  const { g, w, h, R, T } = c;
+  const big = Math.round(Math.max(20, Math.min(76, h * 0.1)));
+  rows.forEach(([value, unit, colour], i) => {
+    if (value === null) return;
+    const number = Math.round(value).toLocaleString("en-US"), unitText = ` ${unit}`;
+    g.font = `italic 900 ${big}px sans-serif`; const nw = g.measureText(number).width;
+    g.font = `italic 800 ${Math.round(big * 0.4)}px sans-serif`; const uw = g.measureText(unitText).width;
+    const start = w - R - 14 - nw - uw, base = T + big * (1.05 + i * 1.1);
+    g.fillStyle = "rgba(8, 8, 10, 0.78)"; g.fillRect(start - 6, base - big * 0.9, nw + uw + 12, big * 1.05);
+    g.fillStyle = colour; g.font = `italic 900 ${big}px sans-serif`; g.fillText(number, start, base);
+    g.font = `italic 800 ${Math.round(big * 0.4)}px sans-serif`; g.fillText(unitText, start + nw, base);
+  });
+}
+
+function drawDyno(s, st, now) {
+  const spec = s.dyno.spec || {}, newest = timeline[timeline.length - 1] || {};
+  const roundUp = (v, step) => Math.max(step, Math.ceil(v / step) * step);
+
+  // torque (left scale) and power (right scale), with room for the maker's figures
+  const ct = chart("dynotime");
+  const xt = timeAxis(ct, now);
+  const tMax = roundUp(1.15 * Math.max(spec.torque_nm || 0, ...timeline.map((p) => p.torque || 0), 40), 20);
+  const pMax = roundUp(1.15 * Math.max(spec.power_bhp || 0, ...timeline.map((p) => p.power || 0), 20), 10);
+  const yT = valueScale(ct, tMax, "left", ct.white, "Nm");
+  const yP = valueScale(ct, pMax, "right", ct.silver, "bhp", false);
+  // The maker's figures: a faint dashed red line each, with the red circle and label at the left end
+  // (the big numbers live on the right); labels that would touch are moved apart.
+  const marks = [];
+  if (spec.torque_nm) marks.push([yT(spec.torque_nm), `MAKER ${spec.torque_nm} Nm @ ${spec.torque_rpm.toLocaleString("en-US")} rpm`]);
+  if (spec.power_bhp) marks.push([yP(spec.power_bhp), `MAKER ${spec.power_bhp} bhp @ ${spec.power_rpm.toLocaleString("en-US")} rpm`]);
+  marks.sort((a, b) => a[0] - b[0]);
+  let previous = -Infinity;
+  for (const [y, text] of marks) {
+    const g = ct.g, px = ct.L + 10, ly = Math.max(y, previous + 16);
+    previous = ly;
+    g.setLineDash([6, 6]); g.strokeStyle = "rgba(255, 61, 46, 0.35)"; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(ct.L, y); g.lineTo(ct.w - ct.R, y); g.stroke(); g.setLineDash([]);
+    g.strokeStyle = ct.accent; g.lineWidth = 2; g.beginPath(); g.arc(px, y, 6, 0, 2 * Math.PI); g.stroke();
+    g.font = "italic 800 12px sans-serif"; g.fillStyle = ct.muted; g.fillText(text, px + 12, ly + 4);
+  }
+  trace(ct, xt, yP, "power", ct.silver);
+  trace(ct, xt, yT, "torque", ct.white);
+  cornerNumbers(ct, [[newest.torque ?? null, "Nm", ct.white], [newest.power ?? null, "bhp", ct.silver]]);
 }
 
 // Every value the car reports: the dashboard's own stats plus everything else, grouped like the panels.
@@ -310,9 +440,9 @@ function renderFuel(s, st) {
   $("used").textContent = f ? fixed(f.used_trip, 2) : "--";
 
   const rows = Object.values(st).filter((x) => x.group === "mixture");
-  $("mixture").innerHTML = rows.map((x) => `<div class="rname">${x.short}</div>
+  $("mixture").innerHTML = rows.map((x) => `<div class="mixrow"><div class="rname">${x.short}</div>
     <div class="rval">${x.text ?? "--"} <small>${x.unit}</small></div>
-    <div class="rextra"><div class="cbar" data-label="${x.label}"><div class="fill"></div><div class="zero"></div></div>${statusHtml(x, true)}</div>`).join("");
+    <div class="rextra"><div class="cbar" data-label="${x.label}"><div class="fill"></div><div class="zero"></div></div>${statusHtml(x, true)}</div></div>`).join("");
   for (const bar of $("mixture").querySelectorAll(".cbar")) setHBar(bar, st[bar.dataset.label]);
 }
 
