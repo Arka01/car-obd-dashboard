@@ -108,6 +108,7 @@ class Stat:
     decimals: int = 1
     short: str = ""  # short name for tight spots (bar meters, status bar)
     empty: str = "waiting..."  # shown while there is no value yet
+    fallback: str = None  # command to read instead if the car doesn't support `command`
 
 
 STATS = [
@@ -144,34 +145,43 @@ STATS = [
 
     # --- bar meters in POWER, and the air-fuel mixture (shown in FUEL)
     # Relative versions (PIDs 45 / 5A) are rescaled to a true 0-100 %; the plain ones never drop below ~10-15 %.
-    Stat("Throttle", "RELATIVE_THROTTLE_POS", "percent", 0, 100, group="meters", short="THROTTLE", decimals=0),
-    Stat("Accelerator pedal", "RELATIVE_ACCEL_POS", "percent", 0, 100, group="meters", short="PEDAL", decimals=0),
-    Stat("Engine load", "ENGINE_LOAD", "percent", 0, 100, group="meters", short="LOAD", decimals=0),
-    Stat("Manifold pressure", "INTAKE_PRESSURE", "kilopascal", 0, 120, every=2, group="meters", short="MANIFOLD",
+    # Cars without them (e.g. a 2021+ Mahindra XUV700 diesel) get the plain ones instead.
+    Stat("Throttle", "RELATIVE_THROTTLE_POS", "percent", 0, 100, every=2, group="meters", short="THROTTLE",
+         decimals=0, fallback="THROTTLE_POS"),
+    Stat("Accelerator pedal", "RELATIVE_ACCEL_POS", "percent", 0, 100, every=2, group="meters", short="PEDAL",
+         decimals=0, fallback="ACCELERATOR_POS_D"),
+    Stat("Engine load", "ENGINE_LOAD", "percent", 0, 100, every=2, group="meters", short="LOAD", decimals=0),
+    Stat("Manifold pressure", "INTAKE_PRESSURE", "kilopascal", 0, 120, every=3, group="meters", short="MANIFOLD",
          decimals=0),
-    Stat("Air flow (MAF)", "MAF", "gps", 0, 60, every=2, group="meters", short="AIRFLOW"),
-    Stat("Timing advance", "TIMING_ADVANCE", "degree", -10, 50, every=2, center=0, group="meters", short="TIMING",
+    Stat("Air flow (MAF)", "MAF", "gps", 0, 60, every=3, group="meters", short="AIRFLOW"),
+    Stat("Timing advance", "TIMING_ADVANCE", "degree", -10, 50, every=3, center=0, group="meters", short="TIMING",
          decimals=0),
-    Stat("Lambda (commanded)", "COMMANDED_EQUIV_RATIO", "ratio", 0.7, 1.3, every=2, center=1.0, group="mixture",
+    Stat("Lambda (commanded)", "COMMANDED_EQUIV_RATIO", "ratio", 0.7, 1.3, every=3, center=1.0, group="mixture",
          short="LAMBDA", decimals=2),  # <1 = rich (more fuel, e.g. full throttle), >1 = lean
-    Stat("Short fuel trim", "SHORT_FUEL_TRIM_1", "percent", -25, 25, every=2, center=0, group="mixture",
+    Stat("Short fuel trim", "SHORT_FUEL_TRIM_1", "percent", -25, 25, every=3, center=0, group="mixture",
          short="TRIM NOW"),
     Stat("Long fuel trim", "LONG_FUEL_TRIM_1", "percent", -25, 25, [
         (lambda v: abs(v) > 20, CRITICAL, "CHECK"),  # engine constantly correcting the mix
         (lambda v: abs(v) > 10, WARNING, "OFF"),
     ], every=10, center=0, group="mixture", short="TRIM LEARN"),
-    Stat("EGR (commanded)", "COMMANDED_EGR", "percent", 0, 100, every=2, group="meters", short="EGR", decimals=0),
+    Stat("EGR (commanded)", "COMMANDED_EGR", "percent", 0, 100, every=3, group="meters", short="EGR", decimals=0),
+
+    # --- turbo and injection (not drawn by the terminal dashboard; used by per-car web designs and ALL SENSORS)
+    # Boost = manifold pressure above the outside air; negative = vacuum (normal on non-turbo petrol engines).
+    Stat("Boost", None, "bar", -1.0, 2.0, center=0, group="turbo", short="BOOST", decimals=2),
+    Stat("Fuel rail pressure", "FUEL_RAIL_PRESSURE_DIRECT", "bar", 0, 2000, every=2, group="engine", short="RAIL",
+         decimals=0),  # common-rail diesel / direct-injection petrol
 
     # --- fuel: inputs to the fuel tracker (drawn as the FUEL LEFT block, not as tiles)
-    Stat("Fuel level", "FUEL_LEVEL", "percent", 0, 100, every=3, group="fuel"),
-    Stat("Fuel rate", "FUEL_RATE", "lph", 0, 15, group="fuel"),  # every update: counting needs it
+    Stat("Fuel level", "FUEL_LEVEL", "percent", 0, 100, every=5, group="fuel"),
+    Stat("Fuel rate", "FUEL_RATE", "lph", 0, 15, every=2, group="fuel"),  # counting adds rate x time, so 2nd is enough
 
     # --- the two pedal sensors, read together every 3rd update for the redundancy check (not drawn)
     Stat("Pedal sensor D", "ACCELERATOR_POS_D", "percent", 0, 100, every=3, group="inputs"),
     Stat("Pedal sensor E", "ACCELERATOR_POS_E", "percent", 0, 100, every=3, group="inputs"),
 
     # --- engine output: raw inputs (not drawn) and the torque/power meters calculated from them
-    Stat("Engine torque %", "ACTUAL_TORQUE_PCT", "percent", -125, 130, group="inputs"),
+    Stat("Engine torque %", "ACTUAL_TORQUE_PCT", "percent", -125, 130, every=2, group="inputs"),
     Stat("Reference torque", "REFERENCE_TORQUE", "Nm", 0, 500, every=50, group="inputs"),  # a fixed number
     Stat("Torque", None, "Nm", -20, 120, center=0, group="power", short="TORQUE", decimals=0),  # 113 Nm peak
     Stat("Power", None, "bhp", -10, 90, center=0, group="power", short="POWER", decimals=0),  # 84 bhp peak
@@ -204,6 +214,34 @@ STATS = [
 
 def stat_named(label):
     return next(s for s in STATS if s.label == label)
+
+
+# Read in the same update, because they're compared with each other (the pedal cross-check).
+READ_TOGETHER = {"Pedal sensor E": "Pedal sensor D"}
+
+
+def read_phases(stats):
+    """{label: offset}: stats read every Nth update are spread evenly over those N updates.
+
+    Each reading takes ~30 ms over Bluetooth. Reading all the slow stats in the same update made every
+    10th update take ~0.7 s instead of ~0.3 s (measured on 15 Oct 2026): a visible stall on the dashboards.
+    """
+    phases, k = {}, 0
+    for stat in stats:
+        if stat.command and stat.every > 1 and stat.label not in READ_TOGETHER:
+            phases[stat.label] = k % stat.every
+            k += 1
+    for label, partner in READ_TOGETHER.items():
+        phases[label] = phases.get(partner, 0)
+    return phases
+
+
+PHASES = read_phases(STATS)
+
+
+def due(n):
+    """The stats to read in update number n (speed and RPM are in every update)."""
+    return [s for s in STATS if s.command and (n + PHASES.get(s.label, 0)) % s.every == 0]
 
 
 def use_car(car):
@@ -311,6 +349,24 @@ def car_is_answering(connection):
     return any(cmd.mode == 1 and not cmd.name.startswith("PIDS_") for cmd in connection.supported_commands)
 
 
+def is_answer(message, request):
+    """True if a reply really answers `request` (b"010C" -> it starts with 0x41).
+
+    Cars can also reply "can't do that now" (a negative response: 7F <service> <reason>), e.g. the
+    Mahindra XUV700 right after the engine is switched off. python-OBD 0.7.3 decodes those bytes as
+    if they were data (speed 17, coolant -23 °C, 4.35 V...), so every reply is checked here first.
+    """
+    return bool(message.data) and message.data[0] == int(request[:2], 16) + 0x40
+
+
+def answered(response, cmd):
+    """The car gave a real value for this command (not silence, not a refusal).
+    The adapter's own commands (AT..., e.g. its voltage reading) aren't OBD replies: only check they answered."""
+    if response.is_null():
+        return False
+    return cmd.command.upper().startswith(b"AT") or all(is_answer(m, cmd.command) for m in response.messages)
+
+
 def read_vin(connection):
     """The car's 17-character chassis number (VIN), or None if it doesn't share it over OBD.
 
@@ -321,7 +377,7 @@ def read_vin(connection):
     from obd.protocols import ECU
 
     def characters(messages):
-        return b"".join(bytes(m.data[3:]) for m in messages if len(m.data) > 3)
+        return b"".join(bytes(m.data[3:]) for m in messages if len(m.data) > 3 and is_answer(m, b"0902"))
 
     response = connection.query(obd.OBDCommand("VIN", "Vehicle ID", b"0902", 0, characters, ECU.ENGINE, False),
                                 force=True)
@@ -337,7 +393,7 @@ def trouble_codes(connection):
     import obd
 
     response = connection.query(obd.commands.GET_DTC)
-    codes = [] if response.is_null() else response.value
+    codes = response.value if answered(response, obd.commands.GET_DTC) else []
     return ", ".join(f"{c} ({d})" for c, d in codes) or "none"
 
 
@@ -372,6 +428,15 @@ def custom_command(name):
     return obd.OBDCommand(name, name, request, size, lambda messages: formula(messages[0].data[2:]), ECU.ENGINE, True)
 
 
+def command_for(connection, stat):
+    """The python-OBD command name to read for a stat on this car: its own, or its fallback if only that is supported."""
+    import obd
+
+    if stat.command in CUSTOM_PIDS or not stat.fallback or connection.supports(obd.commands[stat.command]):
+        return stat.command
+    return stat.fallback if connection.supports(obd.commands[stat.fallback]) else stat.command
+
+
 def read_stats(connection, stats):
     """{label: number}, or None (no data) / NOT_SUPPORTED (car doesn't report it)."""
     import obd
@@ -381,12 +446,12 @@ def read_stats(connection, stats):
         if stat.command in CUSTOM_PIDS:
             values[stat.label] = read_custom(connection, stat.command)
             continue
-        cmd = obd.commands[stat.command]
+        cmd = obd.commands[command_for(connection, stat)]
         if not connection.supports(cmd):
             values[stat.label] = NOT_SUPPORTED
             continue
         response = connection.query(cmd)
-        values[stat.label] = None if response.is_null() else response.value.to(stat.unit).magnitude
+        values[stat.label] = response.value.to(stat.unit).magnitude if answered(response, cmd) else None
     return values
 
 
@@ -394,8 +459,9 @@ def read_custom(connection, name):
     """python-OBD doesn't track support for these, so just ask, and give up after 3 silent tries."""
     if CUSTOM_FAILURES.get(name, 0) >= 3:
         return NOT_SUPPORTED
-    response = connection.query(custom_command(name), force=True)
-    if response.is_null():
+    cmd = custom_command(name)
+    response = connection.query(cmd, force=True)
+    if not answered(response, cmd):
         CUSTOM_FAILURES[name] = CUSTOM_FAILURES.get(name, 0) + 1
         return None
     CUSTOM_FAILURES[name] = 0
@@ -414,7 +480,7 @@ def read_everything(connection):
     values = {}
     for cmd in sorted(commands, key=lambda c: c.pid):
         response = connection.query(cmd)
-        text = "no data" if response.is_null() else describe(response.value)
+        text = describe(response.value) if answered(response, cmd) else "no data"
         if text is not None:
             number = response.value.magnitude if hasattr(response.value, "magnitude") else None
             values[cmd.desc] = (text, number)
@@ -429,7 +495,7 @@ class ExtraReader:
     """
 
     def __init__(self, connection):
-        known = {s.command for s in STATS if s.command}
+        known = {command_for(connection, s) for s in STATS if s.command}  # already read as a dashboard stat
         self.connection = connection
         self.commands = sorted((c for c in connection.supported_commands
                                 if c.mode == 1 and not c.name.startswith("PIDS_") and c.name not in known),
@@ -447,7 +513,7 @@ class ExtraReader:
         cmd = self.commands[self.turn % len(self.commands)]
         self.turn += 1
         response = self.connection.query(cmd)
-        if response.is_null():
+        if not answered(response, cmd):
             return {cmd.desc: None}
         value = response.value
         if hasattr(value, "magnitude"):
@@ -458,6 +524,198 @@ class ExtraReader:
             self.commands.remove(cmd)
             return {}
         return {cmd.desc: text}
+
+
+class MultiReader:
+    """--fast-read: ask for up to 6 live values in one request instead of one request each.
+
+    The OBD standard allows up to 6 PIDs in one service 01 request (still read-only); the engine computer
+    answers them back to back in one reply, e.g. 41 0C 1A F8 0D 32 11 2B. Each request costs ~30 ms over
+    Bluetooth, so fewer requests mean faster updates.
+
+    The stats go into fixed groups (fastest-changing first: RPM and speed are in group 1, read every
+    update). Fixed groups let python-OBD learn how many reply lines each one gets, so the adapter answers
+    without waiting for a timeout.
+
+    Guarding the data: check() reads every value the normal way first, then compares each group's
+    combined reply with those readings, and only switches on if they agree and it's faster. During the
+    drive a garbled reply (unknown PID, too short, a refusal) means that group's values are read the normal
+    way instead; after 3 garbled replies in a row the group is switched off for the rest of the run.
+    """
+
+    MAX = 6
+    MIN_SPEEDUP = 1.5  # not worth it below this
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.groups = []
+        self.note = "off"
+
+    @property
+    def on(self):
+        return any(not g["off"] for g in self.groups)
+
+    def covers(self, label):
+        """True if a working group reads this stat (so the normal schedule skips it)."""
+        return any(label in g["labels"] for g in self.groups if not g["off"])
+
+    def _spec(self, stat):
+        """(pid, data bytes, decode) for a stat that can go in a combined request, or None."""
+        import obd
+        from obd.protocols import ECU
+        from obd.protocols.protocol import Message
+
+        name = command_for(self.connection, stat)
+        if name in CUSTOM_PIDS:
+            request, size, formula = CUSTOM_PIDS[name]
+            return int(request[2:4], 16), size - 2, lambda chunk: float(formula(chunk))
+        cmd = obd.commands[name]
+        if cmd.mode != 1 or cmd.pid is None or cmd.bytes <= 2 or not self.connection.supports(cmd):
+            return None
+
+        def decode(chunk, cmd=cmd, unit=stat.unit):
+            message = Message([])
+            message.data, message.ecu = bytearray([0x41, cmd.pid]) + bytearray(chunk), ECU.ENGINE
+            return cmd([message]).value.to(unit).magnitude
+
+        return cmd.pid, cmd.bytes - 2, decode
+
+    def _group(self, stats, every, phase):
+        import obd
+        from obd.protocols import ECU
+
+        specs = {self._spec(s)[0]: (s.label,) + self._spec(s)[1:] for s in stats}
+        request = b"01" + "".join(f"{pid:02X}" for pid in specs).encode()
+        command = obd.OBDCommand("MULTI_" + request.decode(), "combined read", request, 0, lambda messages: messages,
+                                 ECU.ENGINE, True)
+        return {"command": command, "specs": specs, "labels": [s.label for s in stats], "every": every,
+                "phase": phase, "failures": 0, "off": False}
+
+    def _ask(self, group):
+        """{label: value} from one combined request, or None if the reply is garbled.
+        Values the car left out are simply missing (the caller reads them the normal way)."""
+        response = self.connection.query(group["command"], force=True)
+        messages = response.value if not response.is_null() else None
+        if not messages:
+            return None
+        data = bytes(messages[0].data)
+        if not data or data[0] != 0x41:
+            return None  # silence or a refusal
+        values, i = {}, 1
+        while i < len(data):
+            spec = group["specs"].get(data[i])
+            if spec is None:
+                if not any(data[i:]):  # padding at the end of the last frame
+                    break
+                return None  # an unexpected PID: the bytes don't line up
+            label, size, decode = spec
+            chunk = data[i + 1:i + 1 + size]
+            if len(chunk) < size:
+                return None  # cut off
+            try:
+                values[label] = decode(chunk)
+            except (TypeError, ValueError, AttributeError, IndexError):
+                return None
+            i += 1 + size
+        return values
+
+    def check(self, stats):
+        """Self-test at connect: build the groups and switch on only if they match normal reads and are faster."""
+        single, seconds = {}, {}
+        for stat in stats:
+            if not stat.command or self._spec(stat) is None:
+                continue
+            started = time.time()
+            value = read_stats(self.connection, [stat])[stat.label]
+            seconds[stat.label] = time.time() - started
+            if as_number(value) is not None:
+                single[stat.label] = value
+        answering = sorted((s for s in stats if s.label in single), key=lambda s: (s.every, STATS.index(s)))
+        if len(answering) < 2:
+            self.note = "off: too few values to combine"
+            return False
+
+        # Fixed groups of up to 6, keeping stats that are compared with each other together.
+        chunks, current = [], []
+        for stat in answering:
+            if stat.label in READ_TOGETHER.values() and len(current) >= self.MAX - 1:
+                chunks.append(current)
+                current = []
+            if len(current) == self.MAX:
+                chunks.append(current)
+                current = []
+            current.append(stat)
+        chunks.append(current)
+        per_every = {}
+        for chunk in chunks:
+            every = min(s.every for s in chunk)  # nothing gets read less often than before
+            self.groups.append(self._group(chunk, every, per_every.get(every, 0) % every))
+            per_every[every] = per_every.get(every, 0) + 1
+
+        combined_time = single_time = 0.0
+        for group in self.groups:
+            self._ask(group)  # the first time, python-OBD learns how many reply lines to expect
+            started = time.time()
+            got = self._ask(group)
+            took = time.time() - started
+            if got is None or set(got) != set(group["labels"]):
+                missing = sorted(set(group["labels"]) - set(got or {}))
+                self.groups, self.note = [], f"off: combined reply incomplete ({', '.join(missing) or 'garbled'})"
+                return False
+            for label, value in got.items():
+                stat = stat_named(label)
+                if abs(value - single[label]) > max(0.05 * (stat.high - stat.low), 1e-6):
+                    self.groups, self.note = [], f"off: {label} read {value:.4g} combined vs {single[label]:.4g} normally"
+                    return False
+            combined_time += took
+            single_time += sum(seconds[label] for label in group["labels"])
+        speedup = single_time / combined_time if combined_time else 0
+        if speedup < self.MIN_SPEEDUP:
+            self.groups, self.note = [], f"off: not faster ({speedup:.1f}x)"
+            return False
+        self.note = (f"on: {len(answering)} values in {len(self.groups)} requests, "
+                     f"{speedup:.1f}x faster than one by one")
+        return True
+
+    def read(self, n):
+        """(values, asked): values from the groups due in update n, and the labels those groups were asked for."""
+        values, asked = {}, set()
+        for group in self.groups:
+            if group["off"] or (n + group["phase"]) % group["every"]:
+                continue
+            asked.update(group["labels"])
+            got = self._ask(group)
+            if got is None:
+                group["failures"] += 1
+                if group["failures"] >= 3:
+                    group["off"] = True
+                    logging.getLogger("obd").warning("fast read: group %s switched off after 3 garbled replies",
+                                                     group["command"].command)
+                continue
+            group["failures"] = 0
+            values.update(got)
+        return values, asked
+
+
+def start_fast_read(connection):
+    """--fast-read: run the self-test and say what came out of it."""
+    print("Testing fast read: several values per request (a few seconds) ...")
+    multi = MultiReader(connection)
+    multi.check(STATS)
+    print(f"  fast read {multi.note}")
+    return multi
+
+
+def read_update(connection, n, multi=None):
+    """One update's readings: the stats due in update n (see due()), combined into fewer requests if
+    --fast-read is on. Anything a combined reply didn't deliver is read the normal way."""
+    if not (multi and multi.on):
+        return read_stats(connection, due(n))
+    values, asked = multi.read(n)
+    retry = [s for s in STATS if s.label in asked and s.label not in values]
+    others = [s for s in due(n) if not multi.covers(s.label)]
+    values.update(read_stats(connection, retry + others))
+    return values
 
 
 def texts(values):
@@ -508,7 +766,9 @@ def fake_values(t):
         "Pedal sensor D": 14.9 + throttle * 0.9 * 0.74,  # raw sensors: offset and different ranges, like the real car
         "Pedal sensor E": 7.5 + throttle * 0.9 * 0.37,
         "Engine load": throttle * 1.2 + 15,
-        "Manifold pressure": 30 + throttle * 1.1,
+        # turbo diesels: boost builds with the throttle; petrol engines run below outside pressure
+        "Manifold pressure": 96 + throttle * 1.7 if CAR.fuel == "diesel" else 30 + throttle * 1.1,
+        "Fuel rail pressure": 300 + throttle * 22 if CAR.fuel == "diesel" else NOT_SUPPORTED,
         "Air flow (MAF)": rpm / 400 + throttle * 0.25,
         "Timing advance": 30 - throttle * 0.3 + random.uniform(-2, 2),
         "Lambda (commanded)": 0.92 if throttle > 50 else 1.0,
@@ -572,6 +832,15 @@ def heat_values(values):
         return {"Heat soak": NOT_SUPPORTED}
     intake, outside = as_number(intake), as_number(outside)
     return {"Heat soak": intake - outside if intake is not None and outside is not None else None}
+
+
+def boost_values(values):
+    """Turbo boost in bar: manifold pressure minus barometric (outside air) pressure."""
+    manifold, outside = values.get("Manifold pressure"), values.get("Barometric pressure")
+    if NOT_SUPPORTED in (manifold, outside):
+        return {"Boost": NOT_SUPPORTED}
+    manifold, outside = as_number(manifold), as_number(outside)
+    return {"Boost": (manifold - outside) / 100 if manifold is not None and outside is not None else None}
 
 
 HOT_ALERTS = {  # coolant/oil alert text -> engine state shown in HEAT (most severe first)
@@ -794,8 +1063,9 @@ class Recorder:
         self.file.close()
 
 
-def save_profile(connection, trouble, path):
-    """What this car supports + one reading of everything, saved next to the run's recording."""
+def save_profile(connection, trouble, path, notes=None):
+    """What this car supports + one reading of everything, saved next to the run's recording.
+    notes: extra facts about the run, e.g. {"fast_read": "on: ..."}."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     profile = {
         "car": CAR.key,
@@ -805,6 +1075,7 @@ def save_profile(connection, trouble, path):
         "trouble_codes": trouble,
         "supported_commands": sorted(c.name for c in connection.supported_commands if c.mode == 1),
         "snapshot": texts(read_everything(connection)),
+        **(notes or {}),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(profile, f, indent=2, ensure_ascii=False)
@@ -877,7 +1148,8 @@ def scan_modules(connection):
     def ask(request):
         """Send one request to every module: {reply address: reply bytes (service + PID echo first)}."""
         def by_module(messages):
-            return {address(m.tx_id): bytes(m.data) for m in messages if m.parsed() and m.tx_id is not None}
+            return {address(m.tx_id): bytes(m.data) for m in messages
+                    if m.parsed() and m.tx_id is not None and is_answer(m, request.encode())}
 
         # fast=False: wait for every module to answer, not just the first one.
         command = obd.OBDCommand(f"PROBE_{request}", f"probe {request}", request.encode(), 0, by_module,
@@ -1090,6 +1362,8 @@ def parse_args():
                         help="Litres just put in (from the pump receipt); use at the start of the drive after refuelling")
     parser.add_argument("--full", action="store_true", help="The tank was filled to the automatic cut-off (full)")
     parser.add_argument("--mute", action="store_true", help="Don't speak the warm-up messages")
+    parser.add_argument("--fast-read", action="store_true",
+                        help="Try reading up to 6 values per request (self-tested at connect; off if it doesn't help)")
     parser.add_argument("--calibrate-gears", action="store_true",
                         help="Measure each gear's RPM per km/h from the car's recorded drives, then exit")
     parser.add_argument("--yes", action="store_true", help="With --calibrate-gears: save without asking")
@@ -1133,7 +1407,7 @@ def main():
     def dashboard(values, took):
         """Add trip-computer values, remember peaks, recent throttle and temperature trends, then draw."""
         values = {**values, **trip.update(values), **engine_output(values), **pedals.update(values),
-                  **heat_values(values)}
+                  **heat_values(values), **boost_values(values)}
         trends.update(values)
         if fuel:
             fuel.update(values, trip.distance, trip.accel)
@@ -1184,10 +1458,14 @@ def main():
 
     trouble = trouble_codes(connection)
     header = f"{CAR.name} · {connection.port_name()} · {connection.protocol_name()} · Trouble codes: {trouble}"
+    multi = start_fast_read(connection) if args.fast_read and not args.all else None
+    if multi and multi.on:
+        header += " · FAST READ"
     # Every real run is recorded, named by date and time (to the second, so runs never overwrite).
     name = f"{'all' if args.all else 'drive'}_{datetime.now():%Y%m%d_%H%M%S}"
     print("Saving what this car supports (a few seconds) ...")
-    print(f"  -> {save_profile(connection, trouble, os.path.join(CAR.recordings, f'{name}_profile.json'))}")
+    notes = {"fast_read": multi.note} if multi else None
+    print(f"  -> {save_profile(connection, trouble, os.path.join(CAR.recordings, f'{name}_profile.json'), notes)}")
     labels = None if args.all else [s.label for s in STATS if s.command]  # --all: whatever the car reports
     recorder = Recorder(os.path.join(CAR.recordings, f"{name}.csv"), labels)
     print(f"Recording readings to {recorder.path}")
@@ -1205,9 +1483,9 @@ def main():
         n = next(updates)
         if battery.engine_off() and n % 20:
             wanted = [s for s in STATS if s.label in ("Battery (port)", "RPM")]
+            fresh = read_stats(connection, wanted)
         else:
-            wanted = [s for s in STATS if s.command and n % s.every == 0]
-        fresh = read_stats(connection, wanted)
+            fresh = read_update(connection, n, multi)
         latest.update(fresh)
         now = time.time()
         latest["_read_at"] = {**latest.get("_read_at", {}), **{label: now for label in fresh}}  # for freshness checks

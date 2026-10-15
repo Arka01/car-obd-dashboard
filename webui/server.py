@@ -89,7 +89,7 @@ def extra_entries(values, units):
     """Everything in the readings that isn't one of the dashboard's own stats, for ALL SENSORS."""
     own = {s.label for s in car.STATS}
     return [{"label": label, "text": None if value is None else extra_text(value, units.get(label)),
-             "group": extra_group(label)}
+             "value": value if isinstance(value, (int, float)) else None, "group": extra_group(label)}
             for label, value in sorted(values.items())
             if label not in own and not label.startswith("_") and label not in ("t", "time")]
 
@@ -136,7 +136,7 @@ class Pipeline:
 
     def process(self, values, took, header, mode):
         values = {**values, **self.trip.update(values), **car.engine_output(values), **self.pedals.update(values),
-                  **car.heat_values(values)}
+                  **car.heat_values(values), **car.boost_values(values)}
         self.trends.update(values)
         if self.fuel:
             self.fuel.update(values, self.trip.distance, self.trip.accel)
@@ -203,7 +203,7 @@ class Feed:
             time.sleep(max(0, interval - took))
 
 
-def live_reader(connection, recorder, battery, extras):
+def live_reader(connection, recorder, battery, extras, multi=None):
     """Read the car like car_dashboard.main's read_car(): each stat every `stat.every` updates; only
     voltage + RPM while the engine is off (to catch the starting dip); every reading recorded.
     Plus one of the car's other values per update, in turn, for ALL SENSORS (extras: car.ExtraReader)."""
@@ -216,8 +216,8 @@ def live_reader(connection, recorder, battery, extras):
             wanted = [s for s in car.STATS if s.label in ("Battery (port)", "RPM")]
             fresh = car.read_stats(connection, wanted)
         else:
-            wanted = [s for s in car.STATS if s.command and n % s.every == 0]
-            fresh = {**car.read_stats(connection, wanted), **extras.read()}
+            # ALL SENSORS values: one every 4th update, so the dashboard's own stats stay quick
+            fresh = {**car.read_update(connection, n, multi), **(extras.read() if n % 4 == 1 else {})}
         latest.update(fresh)
         now = time.time()
         latest["_read_at"] = {**latest.get("_read_at", {}), **{label: now for label in fresh}}
@@ -305,6 +305,8 @@ def parse_args():
     parser.add_argument("--refuel", type=float, metavar="LITRES", help="Litres just put in (pump receipt)")
     parser.add_argument("--full", action="store_true", help="The tank was filled to the automatic cut-off")
     parser.add_argument("--mute", action="store_true", help="Don't speak the warm-up messages")
+    parser.add_argument("--fast-read", action="store_true",
+                        help="Try reading up to 6 values per request (self-tested at connect; off if it doesn't help)")
     parser.add_argument("--web-port", type=int, default=8765, help="Port for the web page (default 8765)")
     parser.add_argument("--interval", type=float, default=0.1, help="Minimum seconds between updates")
     return parser.parse_args()
@@ -355,17 +357,21 @@ def main():
             return
         pipeline = Pipeline(live, args.refuel, args.full, args.mute)  # only now: check_car may switch the car
         trouble = car.trouble_codes(connection)
+        multi = car.start_fast_read(connection) if args.fast_read else None
         name = f"drive_{datetime.now():%Y%m%d_%H%M%S}"  # every real run is recorded, like the terminal one
         print("Saving what this car supports (a few seconds) ...")
-        print(f"  -> {car.save_profile(connection, trouble, os.path.join(car.CAR.recordings, f'{name}_profile.json'))}")
+        profile_path = os.path.join(car.CAR.recordings, f"{name}_profile.json")
+        print(f"  -> {car.save_profile(connection, trouble, profile_path, {'fast_read': multi.note} if multi else None)}")
         extras = car.ExtraReader(connection)
         pipeline.units = extras.units
         recorder = car.Recorder(os.path.join(car.CAR.recordings, f"{name}.csv"),
                                 [s.label for s in car.STATS if s.command] + extras.labels)
         print(f"Recording readings to {recorder.path}")
         car.log_to_file()
-        read = live_reader(connection, recorder, pipeline.battery, extras)
+        read = live_reader(connection, recorder, pipeline.battery, extras, multi)
         header = f"{car.CAR.name} · {connection.port_name()} · {connection.protocol_name()} · codes: {trouble} · ● REC"
+        if multi and multi.on:
+            header += " · FAST READ"
         mode, interval = "live", args.interval
 
     ui = car.CAR.path("ui")

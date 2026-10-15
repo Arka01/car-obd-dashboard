@@ -27,6 +27,17 @@ type `powershell` in the address bar, press Enter). If `python` isn't recognised
 Set-Alias python "C:\Program Files\Python39\python.exe"
 ```
 
+**Prefer Command Prompt (cmd)?** Everything works there too. Open cmd in the folder the same way
+(type `cmd` in the File Explorer address bar), and use this instead of `Set-Alias`:
+
+```bat
+set PATH=C:\Program Files\Python39;%PATH%
+```
+
+It lasts until that cmd window is closed. All `python …` commands in this guide are the same in cmd.
+The only PowerShell-only line is the `adb` one (section 5); in cmd it's
+`"%USERPROFILE%\Documents\platform-tools\adb.exe" reverse tcp:8765 tcp:8765`.
+
 **Best look:** use **Windows Terminal**, maximised.
 
 **Stop anything:** press **Ctrl+C**.
@@ -60,6 +71,7 @@ The car's **protocol comes from its `car.json`** (the Tiago's is 6, CAN 11-bit 5
 | Find the vLinker's COM port | `python car_dashboard.py --list-ports` | Adapter paired |
 | Troubleshoot the connection | add `--debug` (traffic goes to `obd.log`) | Yes |
 | Drive without the spoken warm-up messages | add `--mute` | — |
+| **Faster updates (try it)** | add `--fast-read` (section 3, "Fast read") | Yes |
 | Slow down screen updates (e.g. if it flickers) | add `--interval 0.5` (seconds between updates; default 0.1) | — |
 | List all options | `python car_dashboard.py --help` | No |
 
@@ -143,8 +155,9 @@ It is **read-only** (never clears codes or changes anything) and takes about a m
 1. finds the car's protocol by itself and reads its **chassis number (VIN)**; the first 3 characters
    name the maker (e.g. `MAT` = Tata Motors);
 2. scans every module for what it supports and reads everything once;
-3. asks a few questions — **Enter** keeps the suggestion in [brackets] or skips:
-   car name, fuel, **tank size** (owner's manual), **engine size**, the RPM where the display turns red;
+3. asks a few questions — just press **Enter** to keep the suggestion shown as `(Enter = …)` or to skip:
+   car name (the maker is added in front if you leave it out), fuel, **tank size** (owner's manual),
+   **engine size**, the RPM where the display turns red;
 4. creates `cars\<name>\` and makes it the car the dashboards use.
 
 Then `python webui\server.py --port COM6` shows everything that car reports. What switches on later:
@@ -154,6 +167,7 @@ Then `python webui\server.py --port COM6` shows everything that car reports. Wha
 | Gear display | the car's gears measured | drive through every gear, then `python car_dashboard.py --calibrate-gears` |
 | Fuel left in litres, range | tank size | answer the question, or set `tank_litres` in `car.json` |
 | Backup fuel estimate | engine size, petrol | answer the question, or set `engine_litres` |
+| Fuel left at all | the car reporting fuel level (PID 2F) or fuel rate (5E) | nothing to do — some cars (e.g. the XUV700 diesel) report neither, so FUEL stays empty |
 
 Already set up (same VIN)? It only refreshes that car's `probe.json`. Back in your own car, add
 `--car tata_tiago_2023` once (or let the VIN pick it).
@@ -163,7 +177,41 @@ off). `cars\_template\car.json` explains every setting.
 
 **A car's own web design:** put files in `cars\<name>\ui\` — they replace the ones in
 `webui\static\` for that car only (e.g. copy `style.css` there and change the colours). Files you don't
-copy keep coming from the shared design.
+copy keep coming from the shared design. A design can also reuse the shared `app.js` and add its own
+script: sections it leaves out are skipped, `window.METERS` picks the bar meters, and its own
+`window.extraRender(snapshot)` is called after every update. Example: the XUV700 below.
+
+### XUV700 diesel dashboard
+Its own design (`cars\mahindra_xuv700_2_2_diesel_2020\ui\`), used automatically in that car:
+
+| Section | What's in it |
+|---|---|
+| **DRIVE** (strip on top) | Shift lights, rev band, RPM, gear, speed |
+| **TURBO** (big) | **Boost** in bar (manifold pressure minus outside air pressure) with this drive's peak; a **60-second boost trace**; the **spool map** (boost vs RPM dots — shows where the turbo kicks in, about 2,000 rpm on the first drive); pedal and load meters; manifold pressure, airflow, charge-air temperature |
+| **ENGINE** (right) | Warm-up state, coolant, intake air, **injection (fuel rail) pressure** with its peak, check-engine status |
+
+There is no FUEL section: this car reports no fuel level or fuel rate. Try it without the car:
+`python webui\server.py --demo --car mahindra_xuv700_2_2_diesel_2020` (the demo makes up oil and
+catalyst temperatures that the real car doesn't report).
+
+### Fast read (optional, still being tried out)
+```powershell
+python webui\server.py --port COM6 --fast-read
+python car_dashboard.py --port COM6 --fast-read
+```
+Normally every value is one request to the car (~30 ms each over Bluetooth). With `--fast-read` the
+dashboard asks for **up to 6 values in one request** — allowed by the OBD standard and still read-only —
+so RPM, speed and the rest update more often.
+
+It tests itself when connecting and prints one line:
+- `fast read on: 26 values in 5 requests, 4.8x faster …` → in use; the header shows **FAST READ**.
+- `fast read off: …` (with the reason) → the car or adapter doesn't handle it well; the dashboard reads
+  the normal way, nothing else changes.
+
+Safety for the data: the combined readings are compared with normal ones before it switches on, and a
+reply that comes back wrong during the drive is read again the normal way (3 in a row switch that part
+off). The result is saved in the drive's `_profile.json` (`"fast_read"`). Tried so far only on a
+simulator: tell us how it does in each car.
 
 ### Demo
 ```powershell

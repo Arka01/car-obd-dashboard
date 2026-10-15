@@ -20,6 +20,7 @@ Then: python webui/server.py   shows everything this car reports.
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -39,7 +40,7 @@ def read_fuel_type(connection):
     if not connection.supports(obd.commands.FUEL_TYPE):
         return None
     response = connection.query(obd.commands.FUEL_TYPE)
-    text = "" if response.is_null() else str(response.value).lower()
+    text = str(response.value).lower() if cd.answered(response, obd.commands.FUEL_TYPE) else ""
     if "hybrid" in text:
         return "hybrid"
     return next((fuel for word, fuel in FUELS.items() if word in text), None)
@@ -49,9 +50,9 @@ def ask(question, default=None, convert=str, interactive=True):
     """Ask in the terminal; Enter keeps the default. Without a terminal (or with --yes) the default is used."""
     if not interactive:
         return default
-    shown = f" [{default}]" if default not in (None, "") else " [skip]"
+    shown = f" (Enter = {default})" if default not in (None, "") else " (Enter = skip)"
     while True:
-        answer = input(f"{question}{shown}: ").strip()
+        answer = re.sub(r"\s*\[.*?\]|\s*\(Enter = .*?\)", "", input(f"{question}{shown}: ")).strip()  # retyped hints
         if not answer:
             return default
         try:
@@ -66,10 +67,25 @@ def litres(text):
     return round(value / 1000, 3) if value > 20 else value
 
 
-def short_name(title):
-    """A short word for the dashboard's top bar: usually the model ("Tata Tiago ..." -> "TIAGO")."""
-    words = [w for w in title.replace("(", " ").split() if w.isalpha()]
-    return (words[1] if len(words) > 1 else words[0] if words else "CAR").upper()[:10]
+GENERIC_WORDS = {"petrol", "diesel", "cng", "lpg", "electric", "hybrid", "car", "my", "turbo", "amt", "manual", "automatic"}
+
+
+def short_name(title, maker=None):
+    """A short word for the dashboard's top bar: the model ("Tata Tiago 1.2 petrol" -> "TIAGO",
+    "Mahindra XUV700 2.2 diesel" -> "XUV700"): the first word with letters that isn't the maker or a generic word."""
+    skip = GENERIC_WORDS | {w.lower() for w in (maker or "").replace("/", " ").split()}
+    words = [w.strip("()[],") for w in title.split()]
+    words = [w for w in words if any(c.isalpha() for c in w)]
+    model = next((w for w in words if w.lower() not in skip), "CAR")
+    return model.upper()[:10]
+
+
+def with_maker(title, maker):
+    """Put the maker in front of the car's name if it isn't there yet ("XUV700 ..." -> "Mahindra XUV700 ...")."""
+    first = (maker or "").split()[0] if maker else ""
+    if first and first.lower() not in title.lower():
+        return f"{first} {title}"
+    return title
 
 
 def free_folder(name):
@@ -133,14 +149,15 @@ def main():
         car = car_profile.load(known)
         print(f"\nThis car is already set up as '{known}' ({car.name}). Updated its probe.json; car.json is unchanged.")
     else:
-        console.print("\n[bold]A few questions[/bold] (Enter keeps the suggestion in \\[brackets], or skips)")
+        console.print("\n[bold]A few questions[/bold] (just press Enter to keep the suggestion or skip)")
         title = args.title or ask("Car name, e.g. Maruti Swift 1.2 petrol (2019)",
                                   f"{maker} car" if maker else "My car", interactive=interactive)
+        title = with_maker(title, maker)
         key = free_folder(car_profile.folder_name(args.name or title))
         with open(os.path.join(CARS_DIR, "_template", "car.json"), encoding="utf-8") as f:
             template = json.load(f)
         car = Car(key=key, folder=os.path.join(CARS_DIR, key), settings=template, name=title,
-                  short_name=short_name(title), brand=maker, protocol=protocol_id,
+                  short_name=short_name(title, maker), brand=maker, protocol=protocol_id,
                   fuel=args.fuel or fuel or ask("Fuel (petrol / diesel / cng)", "petrol", interactive=interactive))
         car.tank_litres = args.tank or ask("Fuel tank size in litres (owner's manual)", None, float, interactive)
         car.engine_litres = args.engine or ask("Engine size in litres or cc, e.g. 1.2 or 1199", None, litres,

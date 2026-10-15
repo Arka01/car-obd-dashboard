@@ -1,5 +1,9 @@
 // Web dashboard: receives one snapshot per update from /stream (Server-Sent Events) and draws it.
 // The snapshot's shape is built in webui/server.py (Pipeline.process).
+//
+// A car's own design (cars/<car>/ui/index.html) can reuse this file: sections it leaves out (e.g. no
+// FUEL panel) are skipped, window.METERS = [labels] picks the bar meters, and window.extraRender(s)
+// is called after every update to draw the design's own parts.
 
 const $ = (id) => document.getElementById(id);
 const LED_COUNT = 12;
@@ -117,7 +121,7 @@ function build(s) {
   }
 
   for (const label of FLUIDS) {
-    if (!s.stats[label]) continue;
+    if (!s.stats[label] || !$("fluids")) continue;
     const box = el("div", "fluid");
     box.innerHTML = `<div class="name">${label.toUpperCase()}</div>
       <div class="line"><span class="num value" data-v></span><span class="unit">°C</span>
@@ -127,7 +131,7 @@ function build(s) {
     $("fluids").appendChild(box);
   }
   for (const label of ["Torque", "Power"]) {
-    if (!s.stats[label]) continue;
+    if (!s.stats[label] || !$("output")) continue;
     const stat = s.stats[label];
     const box = el("div", "out");
     box.dataset.label = label;
@@ -135,7 +139,9 @@ function build(s) {
       <span class="unit">${stat.unit}</span></div><div class="hbar"><div class="fill"></div><div class="zero"></div></div>`;
     $("output").appendChild(box);
   }
-  for (const stat of Object.values(s.stats).filter((x) => x.group === "meters")) {
+  const meters = Object.values(s.stats).filter((x) => x.group === "meters" && (!window.METERS || window.METERS.includes(x.label)));
+  if (window.METERS) meters.sort((a, b) => window.METERS.indexOf(a.label) - window.METERS.indexOf(b.label));
+  for (const stat of $("meters") ? meters : []) {
     const box = el("div", "meter");
     box.dataset.label = stat.label;
     box.innerHTML = `<div class="mval" data-v></div><div class="vbar"><div class="fill"></div>
@@ -157,20 +163,22 @@ function render(s) {
 
   // Alerts: the affected section glows red, the banner names the problem.
   const alerted = new Set(s.alerts.map((a) => a.section));
-  for (const id of ["HEAT", "POWER", "FUEL", "STATUS"]) $(id).classList.toggle("alert", alerted.has(id));
+  for (const id of ["HEAT", "POWER", "FUEL", "STATUS"]) $(id)?.classList.toggle("alert", alerted.has(id));
   $("banner").classList.toggle("hidden", s.alerts.length === 0);
   $("banner").textContent = s.alerts.map((a) => a.text).join("     ");
 
-  renderHeat(s, st);
-  renderPower(s, st);
-  renderFuel(s, st);
+  if ($("HEAT")) renderHeat(s, st);
+  if ($("POWER")) renderPower(s, st);
+  if ($("FUEL")) renderFuel(s, st);
   renderStatus(s, st);
   if (!$("ALL").classList.contains("hidden")) renderAll(s, st);
+  if (window.extraRender) window.extraRender(s);
   speak(s.say);
 }
 
 // Every value the car reports: the dashboard's own stats plus everything else, grouped like the panels.
-const PANEL_OF = { power: "POWER", meters: "POWER", heat: "HEAT", mixture: "FUEL", fuel: "FUEL", status: "OTHER" };
+const PANEL_OF = { power: "POWER", meters: "POWER", turbo: "POWER", heat: "HEAT", mixture: "FUEL", fuel: "FUEL",
+                   engine: "OTHER", status: "OTHER" };
 function renderAll(s, st) {
   const groups = { POWER: [], HEAT: [], FUEL: [], OTHER: [] };
   for (const x of Object.values(st)) {
@@ -238,12 +246,12 @@ function renderPower(s, st) {
   $("gear").textContent = gear && gear.value ? String(Math.round(gear.value)) : "-";
   $("speed").textContent = st.Speed && st.Speed.value !== null ? Math.round(st.Speed.value) : "--";
 
-  for (const box of $("output").children) {
+  for (const box of $("output")?.children ?? []) {
     const stat = st[box.dataset.label];
     box.querySelector("[data-v]").textContent = stat && stat.text !== null ? stat.text : "--";
     setHBar(box.querySelector(".hbar"), stat);
   }
-  for (const box of $("meters").children) {
+  for (const box of $("meters")?.children ?? []) {
     const stat = st[box.dataset.label];
     box.classList.toggle("hidden", !stat);
     if (!stat) continue;
@@ -252,7 +260,7 @@ function renderPower(s, st) {
   }
 
   const sprint = ["0-60 km/h best", "0-100 km/h best", "Acceleration"].filter((l) => st[l]);
-  $("sprint").innerHTML = sprint.map((l) => `<div><span>${st[l].short}</span><b>${st[l].text ?? "--"}</b> ${st[l].text !== null ? st[l].unit : ""}</div>`).join("");
+  if ($("sprint")) $("sprint").innerHTML = sprint.map((l) => `<div><span>${st[l].short}</span><b>${st[l].text ?? "--"}</b> ${st[l].text !== null ? st[l].unit : ""}</div>`).join("");
 }
 
 // Vertical bar meter: fills from the bottom, or up/down from `center`; thin line at the peak.

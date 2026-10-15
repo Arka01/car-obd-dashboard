@@ -1,0 +1,28 @@
+{
+  "name": "Mahindra XUV700 2.2 diesel (2020)",
+  "short_name": "XUV700",
+  "brand": "Mahindra",
+  "fuel": "diesel",
+  "protocol": "6",
+  "shift_rpm": 5000,
+  "redline_rpm": 5500,
+  "tank_litres": 55.0,
+  "engine_litres": 2.2,
+  "volumetric_efficiency": 0.85,
+  "gears": {
+    "rpm_per_kmh": null,
+    "gear_ratios": null,
+    "final_drive": null,
+    "tyre": null
+  },
+  "notes": {
+    "about": "new_car_probe.py fills this in. null = unknown: whatever needs it is switched off, everything else still works.",
+    "protocol": "ELM327 protocol id found by the probe, e.g. \"6\"; null = auto-detect each time (slower to connect)",
+    "shift_rpm / redline_rpm": "RPM where the RPM display turns amber / red: your own limit, not necessarily the engine's maximum",
+    "tank_litres": "from the owner's manual; needed for fuel left in litres and range",
+    "engine_litres": "engine size, e.g. 1.199 for 1199 cc; petrol only: backup fuel estimate from the air taken in",
+    "gears.rpm_per_kmh": "filled by  python car_dashboard.py --calibrate-gears  after a drive through every gear; turns on the gear display",
+    "gears.gear_ratios / final_drive / tyre": "optional maker specs, e.g. tyre \"175/60 R15\": give a gear guess before calibrating",
+    "probe_2026_10_15": "engine module only (7E8); no fuel level/rate, oil temp, torque PIDs or relative throttle/pedal; throttle and pedal use PIDs 11 / 49"
+  }
+}

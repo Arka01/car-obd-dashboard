@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#05070a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>XUV700 · Car Dashboard</title>
+  <!-- XUV700 2.2 diesel design: DRIVE strip on top, TURBO big, ENGINE on the right (no fuel data on this car).
+       style.css and app.js are the shared ones (webui/static); diesel.css / diesel.js add the turbo parts. -->
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="diesel.css">
+</head>
+<body class="diesel">
+  <div id="start" class="overlay">
+    <div class="start-card">
+      <div class="slashes"><i></i><i></i><i></i></div>
+      <h1>XUV700 · TURBO</h1>
+      <p>Tap to start</p>
+      <small>full screen · screen stays on · spoken warm-up messages</small>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="brand"><div class="slashes"><i></i><i></i><i></i></div><span id="brand">XUV700</span></div>
+    <button id="view" class="tab" type="button">ALL SENSORS</button>
+    <div id="header" class="conn">connecting…</div>
+    <div class="topright"><span id="clock"></span><span id="took"></span><span id="link" class="link" title="data link">●</span></div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main class="dgrid">
+    <!-- DRIVE: shift lights + rev band | RPM | GEAR | SPEED (drawn by the shared app.js: section id POWER) -->
+    <section id="POWER" class="panel drive">
+      <h2>DRIVE</h2>
+      <div class="drive-row">
+        <div class="drive-rev">
+          <div id="leds" class="leds"></div>
+          <div class="rev"><div id="revband" class="revband"></div><div id="revscale" class="revscale"></div></div>
+          <div id="rpmwarn" class="rpmwarn"></div>
+        </div>
+        <div class="readout"><label>RPM</label><div id="rpm" class="num rpm">--</div></div>
+        <div class="gear-wrap"><div class="hex"><span id="gear">-</span></div></div>
+        <div class="readout"><label>KM/H</label><div id="speed" class="num speed">--</div></div>
+      </div>
+    </section>
+
+    <!-- TURBO: drawn by diesel.js -->
+    <section id="TURBO" class="panel turbo">
+      <h2>TURBO</h2>
+      <div class="boost-row">
+        <div class="boost-main">
+          <label>BOOST <span id="boostpeak" class="muted"></span></label>
+          <div class="num boost"><span id="boost">--</span><small> BAR</small></div>
+          <div class="boostbar"><div id="boostfill" class="bfill"></div><div id="boostpeakmark" class="bpeak"></div><div id="boostticks" class="bticks"></div></div>
+        </div>
+        <div id="meters" class="meters"></div>
+      </div>
+      <div class="graphs">
+        <div class="graph"><label>BOOST · LAST 60 S</label><canvas id="trace"></canvas></div>
+        <div class="graph spool"><label>SPOOL MAP · BOOST vs RPM</label><canvas id="spool"></canvas></div>
+      </div>
+      <div class="ttiles">
+        <div class="tile"><label>MANIFOLD</label><div><b id="manifold">--</b> kPa</div></div>
+        <div class="tile"><label>AIRFLOW</label><div><b id="airflow">--</b> g/s</div></div>
+        <div class="tile"><label>CHARGE AIR</label><div><b id="chargeair">--</b> °C</div></div>
+      </div>
+    </section>
+
+    <!-- ENGINE: warm-up state, coolant, intake (shared app.js: section id HEAT) + injection, checks (diesel.js) -->
+    <section id="HEAT" class="panel heat">
+      <h2>ENGINE</h2>
+      <div id="engine" class="engine-state"></div>
+      <div id="fluids" class="fluids"></div>
+      <div id="temps" class="rows"></div>
+      <div class="rail">
+        <label>INJECTION · RAIL PRESSURE</label>
+        <div class="num railv"><span id="rail">--</span><small> BAR</small></div>
+        <div class="hbar"><div id="railfill" class="fill"></div><div id="railpeak" class="peak"></div></div>
+      </div>
+      <div id="checks" class="rows checks"></div>
+    </section>
+  </main>
+
+  <section id="ALL" class="panel all hidden">
+    <h2>ALL SENSORS <span id="allcount" class="muted"></span></h2>
+    <div id="allgroups" class="allgroups"></div>
+  </section>
+
+  <footer id="STATUS" class="statusbar">
+    <div id="battery" class="battery"></div>
+    <div id="status" class="status-items"></div>
+    <div id="hint" class="hint"></div>
+  </footer>
+
+  <script>window.METERS = ["Accelerator pedal", "Engine load"];  // the bar meters shown next to the boost</script>
+  <script src="app.js"></script>
+  <script src="diesel.js"></script>
+</body>
+</html>

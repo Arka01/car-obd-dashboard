@@ -1,0 +1,65 @@
+/* XUV700 diesel layout: a DRIVE strip across the top, TURBO big below-left, ENGINE on the right.
+   Colours, fonts and parts (LEDs, rev band, hex gear, meters) come from the shared style.css. */
+.dgrid { flex: 1; min-height: 0; display: grid; gap: 10px;
+  grid-template-columns: 1.85fr 1fr; grid-template-rows: auto 1fr;
+  grid-template-areas: "drive drive" "turbo engine"; }
+.drive { grid-area: drive; padding-top: 10px; padding-bottom: 8px; }
+.turbo { grid-area: turbo; }
+.heat { grid-area: engine; }
+body.show-all .dgrid { display: none; }
+
+/* DRIVE strip */
+.drive-row { display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: clamp(10px, 2vw, 28px); }
+.drive-rev { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.drive .revband { height: clamp(26px, 5vh, 54px); }
+.drive .leds { justify-content: flex-start; padding-left: 8px; }
+.drive .rpmwarn { margin-top: 0; min-height: 1.1em; padding-left: 8px; }
+.drive .readout .rpm { font-size: clamp(28px, 3.6vw, 56px); }
+.drive .readout .speed { font-size: clamp(40px, 5.6vw, 88px); }
+.drive .hex { width: clamp(60px, 6.5vw, 100px); margin: 0; }
+.drive .hex span { font-size: clamp(36px, 4.6vw, 70px); }
+
+/* TURBO */
+.boost-row { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: stretch; }
+.boost { font-size: clamp(76px, 11vw, 190px); line-height: 0.85; text-shadow: 0 0 40px rgba(255,255,255,0.22); }
+.boost small { font-size: 0.22em; color: var(--muted); letter-spacing: 0.1em; }
+.boost.vac { color: var(--muted); text-shadow: none; }   /* below outside pressure: no boost */
+.boostbar { position: relative; height: clamp(14px, 2.2vh, 22px); margin-top: 10px; transform: skewX(-20deg); overflow: hidden;
+  background: repeating-linear-gradient(90deg, #2a2a30 0 2px, var(--track) 2px 5%); }
+.bfill { position: absolute; top: 0; bottom: 0; left: 0; width: 0; transition: width .12s;
+  background: linear-gradient(90deg, var(--fill-2), var(--fill) 70%, #fff); box-shadow: 0 0 16px rgba(255,255,255,.5); }
+.bpeak { position: absolute; top: 0; bottom: 0; width: 3px; left: -10px; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+.bticks { position: absolute; inset: 0; pointer-events: none; }
+.bticks span { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,.35); }
+.turbo .meters { min-height: 0; width: clamp(90px, 10vw, 150px); }
+.turbo .vbar { min-height: 60px; }
+
+.graphs { flex: 1; min-height: 0; display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; }
+.graph { display: flex; flex-direction: column; gap: 4px; min-height: 0; }
+.graph canvas { flex: 1; min-height: 50px; width: 100%; background: #0a0a0d; border: 1px solid var(--line); }
+.ttiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+
+/* ENGINE */
+.rail .railv { font-size: clamp(30px, 3.6vw, 56px); }
+.rail .railv small { font-size: 0.35em; color: var(--muted); }
+.checks { margin-top: auto; }
+
+/* phone landscape */
+@media (max-height: 480px) {
+  .dgrid { gap: 5px; }
+  .drive { padding-top: 6px; padding-bottom: 4px; }
+  .drive h2 { display: none; }
+  .drive .revband { height: 20px; } .drive .revscale { height: 12px; font-size: 9px; }
+  .drive .readout .rpm { font-size: 26px; } .drive .readout .speed { font-size: 40px; }
+  .drive .hex { width: 54px; } .drive .hex span { font-size: 32px; }
+  .drive .readout label { font-size: 9px; }
+  .boost { font-size: 72px; }
+  .boostbar { margin-top: 4px; height: 12px; }
+  .turbo .meters { width: 80px; } .turbo .vbar { min-height: 30px; }
+  .graph label { font-size: 9px; } .graph canvas { min-height: 30px; }
+  .ttiles { gap: 4px; }
+  .heat .engine-state span { display: none; }
+  .heat .fluids { gap: 2px; }
+  .rail .railv { font-size: 24px; } .rail label { font-size: 9px; } .rail .hbar { margin-top: 2px; height: 7px; }
+  .checks { font-size: 11px; gap: 2px 8px; }
+}

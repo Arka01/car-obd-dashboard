@@ -14,8 +14,14 @@ Vgate vLinker MC over Bluetooth on Windows). README.md is the human operator gui
 - `cars/<car>/ui/` — optional per-car web design; files there override `webui/static/`.
 
 ## Rules
-1. **Read-only on the car.** Only OBD services 01, 03, 07, 09 (and ELM `AT` setup commands). Never
-   send service 04 (clear codes), 08, 2F, 31 or anything that writes, resets or actuates.
+1. **Read-only on the car, standard requests only.** Allowed: the standard OBD-II read services
+   01 (live data), 03 (stored codes), 06 (on-board self-test results), 07 (pending codes),
+   09 (vehicle info), plus ELM `AT` setup commands. Never send anything that writes, resets,
+   actuates or unlocks: 04 (clear codes), 08 (actuator tests), 10 (session change), 11 (reset),
+   14 (clear codes), 27 (security access), 2E / 3B (write data), 2F / 31 (control and routines),
+   34-37 (software transfer). No manufacturer-specific reads (21 / 22 / 23) and no scanning for
+   undocumented IDs either: the owners decided to stay with standard requests (2026-10-15).
+   Changing this list needs the owner's explicit OK.
 2. **No car-specific numbers in shared code.** Tank, engine size, RPM limits, gears, protocol go in
    `cars/<car>/car.json` (with the source in its `notes`). A missing value means `null` (feature off),
    never a guess presented as fact.
